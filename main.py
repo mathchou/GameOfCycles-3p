@@ -15,9 +15,8 @@ def is_legal(vec):
 # CIRCULAR CANONICAL FORM
 # ----------------------------
 def find_longest_circular_runs(vec):
-    """Return the length and start indices of all longest runs of 1's (circular)."""
     n = len(vec)
-    doubled = vec + vec  # duplicate for circularity
+    doubled = vec + vec
     max_run = 0
     current_run = 0
     temp_start = 0
@@ -37,16 +36,10 @@ def find_longest_circular_runs(vec):
         else:
             current_run = 0
 
-    return max_run, list(set(start_indices))  # remove duplicates
+    return max_run, list(set(start_indices))
 
 def canonicalize_circular(vec):
-    """
-    Strong canonical form:
-    1. Flip if -1's outnumber 1's
-    2. Rotate so the longest run of 1's is first (circular)
-    3. Pick the lexicographically largest rotation
-    """
-    vec = [int(x) for x in vec]  # ensure Python ints
+    vec = [int(x) for x in vec]
 
     # Step 1: flip if needed
     if vec.count(1) < vec.count(-1):
@@ -57,42 +50,37 @@ def canonicalize_circular(vec):
     if max_run == 0:
         return tuple(vec)  # no 1's
 
-    # Step 3: rotations starting at longest runs
-    rotations = [vec[start:] + vec[:start] for start in start_indices]
-
-    # Step 4: pick lexicographically largest
-    return tuple(max(rotations))
+    # Step 3: generator to avoid storing all rotations
+    n = len(vec)
+    best = None
+    for start in start_indices:
+        rotation = tuple(vec[start:] + vec[:start])
+        if best is None or rotation > best:
+            best = rotation
+    return best
 
 # ----------------------------
 # LEGAL MOVES
 # ----------------------------
 def legal_moves(board):
-    """Return all legal boards after one move (change a 0 to 1 or -1)."""
-    moves = []
+    """Generate all legal moves (0 -> 1 or -1)."""
     for i, val in enumerate(board):
         if val == 0:
             for new_val in [1, -1]:
                 new_board = list(board)
                 new_board[i] = new_val
                 if is_legal(new_board):
-                    moves.append(new_board)
-    return moves
+                    yield tuple(new_board)  # yield instead of list
 
 # ----------------------------
 # GENERATE GAME GRAPH
 # ----------------------------
 def generate_game_graph(n):
-    """
-    Generate all legal canonical boards and map moves.
-    Returns:
-        nodes: set of canonical boards
-        edges: dict mapping canonical board -> list of canonical boards reachable in one move
-    """
     empty_board = tuple([0] * n)
     start_board = canonicalize_circular(empty_board)
 
     nodes = set()
-    edges = defaultdict(list)
+    edges = defaultdict(set)
     queue = deque([start_board])
 
     while queue:
@@ -103,8 +91,7 @@ def generate_game_graph(n):
 
         for move in legal_moves(board):
             move_canonical = canonicalize_circular(move)
-            if move_canonical not in edges[board]:
-                edges[board].append(move_canonical)
+            edges[board].add(move_canonical)
             if move_canonical not in nodes:
                 queue.append(move_canonical)
 
@@ -114,7 +101,6 @@ def generate_game_graph(n):
 # PRETTY PRINT
 # ----------------------------
 def print_graph(edges, n=5):
-    """Print a sample of the graph nicely."""
     for b, moves in list(edges.items())[:n]:
         print(f"{list(b)} -> {[list(m) for m in moves]}")
 
@@ -122,8 +108,8 @@ def print_graph(edges, n=5):
 # EXAMPLE USAGE
 # ----------------------------
 if __name__ == "__main__":
-    n = 10
+    n = 15  # can now go higher without memory bloat
     nodes, edges = generate_game_graph(n)
     print(f"Total legal canonical boards for n={n}: {len(nodes)}")
     print("Sample edges:")
-    print_graph(edges, n)
+    print_graph(edges, 5)
