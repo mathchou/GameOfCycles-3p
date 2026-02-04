@@ -122,8 +122,8 @@ def print_graph(edges, n=5):
 # EXAMPLE USAGE
 # ----------------------------
 if __name__ == "__main__":
-    n = 4
+    n = 10
     nodes, edges = generate_game_graph(n)
     print(f"Total legal canonical boards for n={n}: {len(nodes)}")
     print("Sample edges:")
-    print_graph(edges)
+    print_graph(edges, n)
