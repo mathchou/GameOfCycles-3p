@@ -425,52 +425,50 @@ import time
 import tracemalloc
 
 if __name__ == "__main__":
-    n = 20  # set your board size here
+    n = 10  # set your board size here
+    print(f"Generating game graph for n = {n}...")
 
-    for n in range(17,21):
-        print(f"Generating game graph for n = {n}...")
+    # ----------------------------
+    # Start timing and memory tracking
+    # ----------------------------
+    start_time = time.time()
+    tracemalloc.start()
 
-        # ----------------------------
-        # Start timing and memory tracking
-        # ----------------------------
-        start_time = time.time()
-        tracemalloc.start()
+    # ----------------------------
+    # Generate nodes and edges
+    # ----------------------------
+    nodes, edges = generate_game_graph(n)
+    compute_winning_strategies(nodes, edges, save_path=f"game_graph_n{n}.pkl")
+    assign_grid_positions(nodes)  # needed for plotting if n < 12
 
-        # ----------------------------
-        # Generate nodes and edges
-        # ----------------------------
-        nodes, edges = generate_game_graph(n)
-        compute_winning_strategies(nodes, edges, save_path=f"game_graph_n{n}.pkl")
-        assign_grid_positions(nodes)  # needed for plotting if n < 12
+    # ----------------------------
+    # Stop memory tracking
+    # ----------------------------
+    current_mem, peak_mem = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    elapsed_time = time.time() - start_time
 
-        # ----------------------------
-        # Stop memory tracking
-        # ----------------------------
-        current_mem, peak_mem = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-        elapsed_time = time.time() - start_time
+    # ----------------------------
+    # Report general info
+    # ----------------------------
+    print(f"Total nodes: {len(nodes)}")
+    print(f"Time elapsed: {elapsed_time:.3f} seconds")
+    print(f"Current memory usage: {current_mem / 1024**2:.3f} MB")
+    print(f"Peak memory usage: {peak_mem / 1024**2:.3f} MB")
 
-        # ----------------------------
-        # Report general info
-        # ----------------------------
-        print(f"Total nodes: {len(nodes)}")
-        print(f"Time elapsed: {elapsed_time:.3f} seconds")
-        print(f"Current memory usage: {current_mem / 1024**2:.3f} MB")
-        print(f"Peak memory usage: {peak_mem / 1024**2:.3f} MB")
-
-        if n < 12:
-            # Plot interactive figure with winning moves highlighted
-            plot_graph_interactive(nodes, edges)
-        else:
-            # For large n, just report base node
-            start_board = tuple([0] * n)
-            start_canon = canonicalize_circular(start_board)
-            attrs = nodes[start_canon]
-            print(f"Starting board: {list(start_canon)}")
-            print(f"Winning strategy at start:")
-            print(f"  Current:  {attrs['Current']}")
-            print(f"  Next:     {attrs['Next']}")
-            print(f"  Previous: {attrs['Previous']}")
+    if n < 12:
+        # Plot interactive figure with winning moves highlighted
+        plot_graph_interactive(nodes, edges)
+    else:
+        # For large n, just report base node
+        start_board = tuple([0] * n)
+        start_canon = canonicalize_circular(start_board)
+        attrs = nodes[start_canon]
+        print(f"Starting board: {list(start_canon)}")
+        print(f"Winning strategy at start:")
+        print(f"  Current:  {attrs['Current']}")
+        print(f"  Next:     {attrs['Next']}")
+        print(f"  Previous: {attrs['Previous']}")
 
 
     # ---------------------------------------
