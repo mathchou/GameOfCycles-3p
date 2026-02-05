@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 
 # Pickled Objects
-.pkl
+*.pkl
 
 # C extensions
 *.so
