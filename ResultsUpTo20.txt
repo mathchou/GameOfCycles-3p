@@ -1,0 +1,226 @@
+C:\Users\mokec\PycharmProjects\GameOfCycles-3p\.venv\Scripts\python.exe C:\Users\mokec\PycharmProjects\GameOfCycles-3p\main.py
+Generating game graph for n = 0...
+Total nodes: 1
+Time elapsed: 0.000 seconds
+Current memory usage: 0.000 MB
+Peak memory usage: 0.001 MB
+Starting board: []
+Winning strategy at start:
+  Current:  True
+  Next:     True
+  Previous: False
+Generating game graph for n = 1...
+Total nodes: 2
+Time elapsed: 0.000 seconds
+Current memory usage: 0.001 MB
+Peak memory usage: 0.002 MB
+Starting board: [0]
+Winning strategy at start:
+  Current:  False
+  Next:     True
+  Previous: True
+Generating game graph for n = 2...
+Total nodes: 3
+Time elapsed: 0.000 seconds
+Current memory usage: 0.002 MB
+Peak memory usage: 0.003 MB
+Starting board: [0, 0]
+Winning strategy at start:
+  Current:  True
+  Next:     False
+  Previous: True
+Generating game graph for n = 3...
+Total nodes: 4
+Time elapsed: 0.000 seconds
+Current memory usage: 0.004 MB
+Peak memory usage: 0.005 MB
+Starting board: [0, 0, 0]
+Winning strategy at start:
+  Current:  True
+  Next:     True
+  Previous: False
+Generating game graph for n = 4...
+Total nodes: 8
+Time elapsed: 0.000 seconds
+Current memory usage: 0.005 MB
+Peak memory usage: 0.006 MB
+Starting board: [0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     True
+  Previous: True
+Generating game graph for n = 5...
+Total nodes: 13
+Time elapsed: 0.001 seconds
+Current memory usage: 0.011 MB
+Peak memory usage: 0.012 MB
+Starting board: [0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  True
+  Next:     True
+  Previous: False
+Generating game graph for n = 6...
+Total nodes: 28
+Time elapsed: 0.002 seconds
+Current memory usage: 0.024 MB
+Peak memory usage: 0.025 MB
+Starting board: [0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     True
+  Previous: False
+Generating game graph for n = 7...
+Total nodes: 54
+Time elapsed: 0.005 seconds
+Current memory usage: 0.052 MB
+Peak memory usage: 0.054 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     False
+  Previous: True
+Generating game graph for n = 8...
+Total nodes: 119
+Time elapsed: 0.008 seconds
+Current memory usage: 0.129 MB
+Peak memory usage: 0.131 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  True
+  Next:     True
+  Previous: False
+Generating game graph for n = 9...
+Total nodes: 256
+Time elapsed: 0.024 seconds
+Current memory usage: 0.313 MB
+Peak memory usage: 0.316 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     True
+  Previous: True
+Generating game graph for n = 10...
+Total nodes: 570
+Time elapsed: 0.054 seconds
+Current memory usage: 0.782 MB
+Peak memory usage: 0.789 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  True
+  Next:     False
+  Previous: True
+Generating game graph for n = 11...
+Total nodes: 1264
+Time elapsed: 0.127 seconds
+Current memory usage: 1.963 MB
+Peak memory usage: 1.975 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     True
+  Previous: False
+Generating game graph for n = 12...
+Total nodes: 2863
+Time elapsed: 0.324 seconds
+Current memory usage: 5.279 MB
+Peak memory usage: 5.303 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     True
+  Previous: True
+Generating game graph for n = 13...
+Total nodes: 6462
+Time elapsed: 0.811 seconds
+Current memory usage: 13.263 MB
+Peak memory usage: 13.316 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  True
+  Next:     False
+  Previous: False
+Generating game graph for n = 14...
+Total nodes: 14738
+Time elapsed: 2.020 seconds
+Current memory usage: 33.014 MB
+Peak memory usage: 33.135 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     True
+  Previous: False
+Generating game graph for n = 15...
+Total nodes: 33655
+Time elapsed: 5.069 seconds
+Current memory usage: 82.045 MB
+Peak memory usage: 82.319 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     False
+  Previous: True
+Generating game graph for n = 16...
+Total nodes: 77199
+Time elapsed: 12.646 seconds
+Current memory usage: 203.281 MB
+Peak memory usage: 203.903 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  True
+  Next:     False
+  Previous: False
+Generating game graph for n = 17...
+Total nodes: 177435
+Time elapsed: 32.012 seconds
+Current memory usage: 513.270 MB
+Peak memory usage: 514.720 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     True
+  Previous: False
+
+Generating game graph for n = 18...
+Graph saved to game_graph_n18.pkl
+Total nodes: 409129
+Time elapsed: 106.112 seconds
+Current memory usage: 1266.932 MB
+Peak memory usage: 3051.630 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     False
+  Previous: False
+Generating game graph for n = 19...
+Graph saved to game_graph_n19.pkl
+Total nodes: 944915
+Time elapsed: 260.402 seconds
+Current memory usage: 3127.686 MB
+Peak memory usage: 7108.287 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     False
+  Previous: False
+Generating game graph for n = 20...
+Graph saved to game_graph_n20.pkl
+Total nodes: 2187217
+Time elapsed: 666.213 seconds
+Current memory usage: 7726.788 MB
+Peak memory usage: 16688.017 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     True
+  Previous: False
+
+Generating game graph for n = 20...
+Total nodes: 2187217
+Time elapsed: 494.734 seconds
+Current memory usage: 7726.927 MB
+Peak memory usage: 7744.802 MB
+Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Winning strategy at start:
+  Current:  False
+  Next:     True
+  Previous: False

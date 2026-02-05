@@ -1,7 +1,7 @@
 import networkx as nx
+import pickle
 import plotly.graph_objects as go
 from collections import deque, defaultdict
-import itertools as it
 
 # ----------------------------
 # LEGALITY & CANONICAL FUNCTIONS
@@ -71,7 +71,8 @@ def generate_game_graph(n):
     start_board = canonicalize_circular(empty_board)
 
     nodes = {}  # key: board tuple, value: attributes dict
-    edges = defaultdict(set)
+    edges = defaultdict(list)  # store tuples: (dst, (index, value))
+
     queue = deque([start_board])
 
     while queue:
@@ -81,159 +82,409 @@ def generate_game_graph(n):
 
         # Add node with initial turn attributes all False
         nodes[board] = {
+            "Previous": False,
             "Current": False,
             "Next": False,
-            "Previous": False,
             "layer": sum(1 for x in board if x != 0)  # number of moves
         }
 
-        for move in legal_moves(board):
-            move_canonical = canonicalize_circular(move)
-            edges[board].add(move_canonical)
-            if move_canonical not in nodes:
-                queue.append(move_canonical)
+        for i, val in enumerate(board):
+            if val == 0:
+                for new_val in [1, -1]:
+                    new_board = list(board)
+                    new_board[i] = new_val
+                    if is_legal(new_board):
+                        move_canonical = canonicalize_circular(new_board)
+                        edges[board].append((move_canonical, (i, new_val)))  # store both index and value
+                        if move_canonical not in nodes:
+                            queue.append(move_canonical)
 
     return nodes, edges
+
 
 # ----------------------------
 # Backward propogation of winning strategies
 # ----------------------------
 
-def compute_winning_strategies(nodes, edges):
-    # Initialize all nodes as unknown
-    for node in nodes:
-        nodes[node]["Current"] = False
-        nodes[node]["Previous"] = False
-        nodes[node]["Next"] = False
+def compute_winning_strategies(nodes, edges, save_path=None):
+    """
+    Compute winning strategies for all nodes.
+    Optionally save the graph to a .gpickle file for later loading.
 
-    changed = True
-    while changed:
-        changed = False
-        for node, node_data in nodes.items():
-            children = edges[node]
+    Args:
+        nodes: dict[node] -> {"Previous": bool, "Current": bool, "Next": bool, "layer": int, ...}
+        edges: dict[node] -> iterable of child nodes
+        save_path: str or None. If provided, save as NetworkX gpickle.
+    """
 
+    # Group nodes by layer
+    layers = defaultdict(list)
+    for node, data in nodes.items():
+        layer = data["layer"]
+        layers[layer].append(node)
+
+    max_layer = max(layers.keys())
+
+    # Process layers from last to first
+    for layer in range(max_layer, -1, -1):
+        for node in layers[layer]:
+            children = [dst for dst, move in edges.get(node, [])]
+
+            # ---- Sink nodes ----
             if len(children) == 0:
-                # Sink: current player loses
-                new_current = False
-                new_previous = True
-                new_next = True
-            else:
-                # If any child leads to a node where Current loses, we can win
-                child_currents = [nodes[child]["Current"] for child in children]
+                nodes[node]["Previous"] = False
+                nodes[node]["Current"] = True
+                nodes[node]["Next"] = True
+                continue
 
-                if any(not c for c in child_currents):
-                    new_current = True  # we can force a win
-                    new_previous = False
-                    new_next = False
+            child_prevs = [nodes[c]["Previous"] for c in children]
+            child_currs = [nodes[c]["Current"] for c in children]
+            child_nexts = [nodes[c]["Next"] for c in children]
+
+            # ---- Current ----
+            nodes[node]["Current"] = any(prev for prev in child_prevs)
+
+            # ---- Next ----
+            nodes[node]["Next"] = all(curr for curr in child_currs)
+
+            # ---- Previous ----
+            nodes[node]["Previous"] = all(nxt for nxt in child_nexts)
+
+    # Optional: save graph as pickle
+    if save_path:
+        G = nx.DiGraph()
+        for node, attrs in nodes.items():
+            G.add_node(node, **attrs)
+        for src, dsts in edges.items():
+            for dst in dsts:
+                if isinstance(dst, tuple) and len(dst) == 2:
+                    dst, move = dst
+                    G.add_edge(src, dst, move=move)
                 else:
-                    new_current = False  # all moves bad → lose
-                    new_previous = True
-                    new_next = True
+                    G.add_edge(src, dst, move=None)
 
-            # Update if changed
-            if (node_data["Current"] != new_current or
-                node_data["Previous"] != new_previous or
-                node_data["Next"] != new_next):
-                node_data["Current"] = new_current
-                node_data["Previous"] = new_previous
-                node_data["Next"] = new_next
-                changed = True
+        with open(save_path, "wb") as f:
+            pickle.dump(G, f)
+        print(f"Graph saved to {save_path}")
 
 
+# ----------------------------
+# Node coloring helper function
+# ----------------------------
+
+def winning_color(attrs):
+    p = attrs["Previous"]
+    c = attrs["Current"]
+    n = attrs["Next"]
+
+    if c and not p and not n:
+        return "blue"
+    if c and p and not n:
+        return "green"
+    if p and not c and not n:
+        return "yellow"
+    if p and not c and n:
+        return "orange"
+    if n and not p and not c:
+        return "red"
+    if c and n and not p:
+        return "purple"
+
+    # Safety net (should not happen)
+    if p and c and n:
+        return "black"   # logically suspicious
+    return "gray"        # no one wins (also suspicious)
 
 
 # ----------------------------
 # INTERACTIVE PLOT
 # ----------------------------
+
+def assign_grid_positions(nodes):
+    """
+    Assigns (x, y) positions so that:
+    - x = layer
+    - y = index within that layer
+    """
+
+    layers = defaultdict(list)
+
+    # Preserve insertion order
+    for node, attrs in nodes.items():
+        layers[attrs["layer"]].append(node)
+
+    for layer, layer_nodes in layers.items():
+        for i, node in enumerate(layer_nodes):
+            nodes[node]["pos"] = (layer, -i)
+
+
 def plot_graph_interactive(nodes, edges):
+    """
+    Interactive Plot:
+    - Hover over a node to highlight all outgoing winning moves.
+    - Edge hover disabled; only node hover triggers display.
+    """
+
     G = nx.DiGraph()
 
+    # ----------------------------
     # Add nodes and edges
-    for node, attr in nodes.items():
-        G.add_node(node, **attr)
+    # ----------------------------
+    for node, attrs in nodes.items():
+        G.add_node(node, **attrs)
+
     for src, dsts in edges.items():
-        for dst in dsts:
-            G.add_edge(src, dst)
+        for dst, move_info in dsts:
+            G.add_edge(src, dst, move=move_info)
 
-    # Sort nodes by number of non-zero entries for grid-like layout
-    sorted_nodes = sorted(G.nodes(), key=lambda n: G.nodes[n]["layer"])
-    layers = defaultdict(list)
-    for node in sorted_nodes:
-        layers[G.nodes[node]["layer"]].append(node)
+    # ----------------------------
+    # Node positions (grid)
+    # ----------------------------
+    pos = {node: attrs["pos"] for node, attrs in nodes.items()}
 
-    # Assign x/y positions for grid layout: columns = layer, rows = nodes within layer
-    pos = {}
-    max_len = max(len(nodes) for nodes in layers.values())
-    for x, layer in enumerate(sorted(layers.keys())):
-        col = layers[layer]
-        for y, node in enumerate(col):
-            # spread rows evenly
-            pos[node] = (x, -y)  # negative y to have top-down ordering
-
-    # Prepare Plotly edge traces
-    edge_x = []
-    edge_y = []
-    for edge in G.edges():
-        x0, y0 = pos[edge[0]]
-        x1, y1 = pos[edge[1]]
-        edge_x += [x0, x1, None]
-        edge_y += [y0, y1, None]
-
-    edge_trace = go.Scatter(
-        x=edge_x, y=edge_y,
-        line=dict(width=1, color='#888'),
-        hoverinfo='none',
-        mode='lines'
+    ordered_nodes = sorted(
+        nodes,
+        key=lambda n: (nodes[n]["layer"], pos[n][1])
     )
 
-    # Prepare Plotly node traces
-    node_x = []
-    node_y = []
+    # ----------------------------
+    # EDGES
+    # ----------------------------
+    edge_x_normal, edge_y_normal, edge_text_normal = [], [], []
+    edge_x_win, edge_y_win, edge_text_win = [], [], []
+
+    for src, dst, data in G.edges(data=True):
+        x0, y0 = pos[src]
+        x1, y1 = pos[dst]
+
+        move_info = data.get("move")
+        label = ""
+        if move_info is not None:
+            move_index, move_value = move_info
+            label = f"Move: index {move_index}, value {move_value}"
+
+        # Determine winning move for Current player
+        if nodes[src]["Current"] and nodes[dst]["Previous"]:
+            edge_x_win += [x0, x1, None]
+            edge_y_win += [y0, y1, None]
+            edge_text_win += [label, label, None]
+        else:
+            edge_x_normal += [x0, x1, None]
+            edge_y_normal += [y0, y1, None]
+            edge_text_normal += [label, label, None]
+
+    # Normal edges
+    edge_trace_normal = go.Scatter(
+        x=edge_x_normal,
+        y=edge_y_normal,
+        mode="lines",
+        line=dict(width=1, color="#000"),
+        showlegend=False
+    )
+
+    # Winning edges: thin visible green line
+    edge_trace_win = go.Scatter(
+        x=edge_x_win,
+        y=edge_y_win,
+        mode="lines",
+        line=dict(width=3, color="green"),
+        showlegend=False
+    )
+
+
+    # ----------------------------
+    # Nodes
+    # ----------------------------
+    node_x = [pos[n][0] for n in ordered_nodes]
+    node_y = [pos[n][1] for n in ordered_nodes]
+    node_colors = [winning_color(nodes[n]) for n in ordered_nodes]
+
     node_text = []
-    node_labels = []
-    for i, node in enumerate(sorted_nodes):
-        x, y = pos[node]
-        node_x.append(x)
-        node_y.append(y)
-        attr = nodes[node]
+    for n in ordered_nodes:
+        # List all outgoing moves and their resulting node
+        moves_info = []
+        for dst, move_info in edges.get(n, []):
+            idx, val = move_info
+            moves_info.append(f"Move {idx}: {val} → {list(dst)}")
+        move_text = "<br>".join(moves_info) if moves_info else "No moves"
         node_text.append(
-            f"{list(node)}<br>Current: {attr['Current']}, Next: {attr['Next']}, Previous: {attr['Previous']}"
+            f"{list(n)}<br>"
+            f"Previous: {nodes[n]['Previous']}<br>"
+            f"Current: {nodes[n]['Current']}<br>"
+            f"Next: {nodes[n]['Next']}<br>"
+            f"{move_text}"
         )
-        node_labels.append(str(i))
 
     node_trace = go.Scatter(
-        x=node_x, y=node_y,
-        mode='markers+text',
-        text=node_labels,
-        hovertext=node_text,
-        hoverinfo='text',
+        x=node_x,
+        y=node_y,
+        mode="markers",
+        hoverinfo="text",
+        text=node_text,
         marker=dict(
-            size=15,
-            line_width=2
+            size=16,
+            color=node_colors,
+            line=dict(width=1, color="black")
+        ),
+        showlegend=False
+    )
+
+    # ----------------------------
+    # Legend
+    # ----------------------------
+    legend_items = [
+        ("Current only", "blue"),
+        ("Current + Previous", "green"),
+        ("Previous only", "yellow"),
+        ("Previous + Next", "orange"),
+        ("Next only", "red"),
+        ("Current + Next", "purple"),
+    ]
+
+    legend_traces = [
+        go.Scatter(
+            x=[None], y=[None],
+            mode="markers",
+            marker=dict(size=14, color=color),
+            name=label,
+            showlegend=True
+        )
+        for label, color in legend_items
+    ]
+
+    # ----------------------------
+    # Figure
+    # ----------------------------
+    fig = go.Figure(
+        data=[edge_trace_normal, edge_trace_win, node_trace] + legend_traces,
+        layout=go.Layout(
+            title=dict(
+                text="Game Graph — Winning Strategy Coalitions",
+                font=dict(size=20)
+            ),
+            showlegend=True,
+            hovermode="closest",
+            margin=dict(l=10, r=10, t=50, b=10),
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
         )
     )
 
-    fig = go.Figure(data=[edge_trace, node_trace],
-                    layout=go.Layout(
-                        title=dict(
-                            text='Game Graph',
-                            font=dict(size=20)
-                        ),
-                        showlegend=False,
-                        hovermode='closest',
-                        margin=dict(b=20, l=5, r=5, t=40),
-                        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False)
-                    )
-                    )
     fig.show()
+
+
+# -------------------------------------
+# Looking Locally
+# -------------------------------------
+
+def extract_subgraph(nodes, edges, center_node, layers=2):
+    """
+    Extract a subgraph centered at `center_node`.
+    - layers=2 includes two moves forward from the center node.
+    """
+    sub_nodes = {center_node: nodes[center_node]}
+    sub_edges = defaultdict(set)
+
+    frontier = [center_node]
+    for _ in range(layers):
+        next_frontier = []
+        for node in frontier:
+            for child in edges.get(node, []):
+                # If the edge is stored with move info
+                if isinstance(child, tuple) and len(child) == 2:
+                    dst, move = child
+                else:
+                    dst, move = child, None
+
+                sub_nodes[dst] = nodes[dst]
+                sub_edges[node].add((dst, move))
+                next_frontier.append((dst, move))
+        frontier = [dst for dst, _ in next_frontier]
+
+    return sub_nodes, sub_edges
+
+
+def plot_zoomed_node(nodes, edges, center_node, layers=2):
+    """
+    Extracts a local neighborhood and plots it.
+    """
+    sub_nodes, sub_edges = extract_subgraph(nodes, edges, center_node, layers)
+
+    # Assign grid positions for this subgraph
+    assign_grid_positions(sub_nodes)
+
+    plot_graph_interactive(sub_nodes, sub_edges)
+
+
 
 # ----------------------------
 # EXAMPLE USAGE
 # ----------------------------
+
+import time
+import tracemalloc
+
 if __name__ == "__main__":
-    n = 6  # keep small for interactivity
+    n = 20  # set your board size here
+
+    for n in range(17,21):
+        print(f"Generating game graph for n = {n}...")
+
+        # ----------------------------
+        # Start timing and memory tracking
+        # ----------------------------
+        start_time = time.time()
+        tracemalloc.start()
+
+        # ----------------------------
+        # Generate nodes and edges
+        # ----------------------------
+        nodes, edges = generate_game_graph(n)
+        compute_winning_strategies(nodes, edges, save_path=f"game_graph_n{n}.pkl")
+        assign_grid_positions(nodes)  # needed for plotting if n < 12
+
+        # ----------------------------
+        # Stop memory tracking
+        # ----------------------------
+        current_mem, peak_mem = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        elapsed_time = time.time() - start_time
+
+        # ----------------------------
+        # Report general info
+        # ----------------------------
+        print(f"Total nodes: {len(nodes)}")
+        print(f"Time elapsed: {elapsed_time:.3f} seconds")
+        print(f"Current memory usage: {current_mem / 1024**2:.3f} MB")
+        print(f"Peak memory usage: {peak_mem / 1024**2:.3f} MB")
+
+        if n < 12:
+            # Plot interactive figure with winning moves highlighted
+            plot_graph_interactive(nodes, edges)
+        else:
+            # For large n, just report base node
+            start_board = tuple([0] * n)
+            start_canon = canonicalize_circular(start_board)
+            attrs = nodes[start_canon]
+            print(f"Starting board: {list(start_canon)}")
+            print(f"Winning strategy at start:")
+            print(f"  Current:  {attrs['Current']}")
+            print(f"  Next:     {attrs['Next']}")
+            print(f"  Previous: {attrs['Previous']}")
+
+
+    # ---------------------------------------
+    # For zooming in to a specific node:
+    # ---------------------------------------
+
+"""
+    n = 8
     nodes, edges = generate_game_graph(n)
     compute_winning_strategies(nodes, edges)
-    print(f"Total nodes: {len(nodes)}")
-    plot_graph_interactive(nodes, edges)
+
+    # User chooses a node to zoom into (can also be start_board)
+    start_board = canonicalize_circular(tuple([0] * n))
+
+    # Plot a neighborhood of 2 layers around the chosen node
+    plot_zoomed_node(nodes, edges, center_node=start_board, layers=2)
+"""

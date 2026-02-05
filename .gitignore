@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Pickled Objects
+.pkl
+
 # C extensions
 *.so
 
