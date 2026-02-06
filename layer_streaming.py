@@ -1,6 +1,10 @@
 from itertools import combinations, product
 from collections import defaultdict
 from main import is_legal, canonicalize_circular, legal_moves
+import time
+import tracemalloc
+from pathlib import Path
+import pickle
 
 def is_partial_legal(board, i):
     # no adjacent different nonzeros
@@ -69,30 +73,33 @@ def generate_edges_from_layer(layer):
 
 def generate_game_graph_memory_efficient(n):
     """
-    Memory-efficient game graph generation.
+    Memory-efficient game graph generation with deduplication after canonicalization.
+    Edges are stored as sets to avoid duplicates.
     Streams layers from depth n down to 0.
     Only keeps two layers in memory at a time.
 
     Returns:
-        edges_total: dict mapping canonical board -> list of canonical boards
+        edges_total: dict mapping canonical board -> set of canonical boards
     """
-    edges_total = defaultdict(list)
+    edges_total = defaultdict(set)
 
-    # Store the previous layer
     prev_layer = set()
 
-    # Generate the deepest layer first
+    # Process layers from deepest to shallowest
     for depth in reversed(range(n + 1)):
         print(f"Processing depth {depth}...")
-        current_layer = boards_at_depth(n, depth)
+        raw_layer = boards_at_depth(n, depth)
 
-        # Build edges from current layer to previous layer
+        # Canonicalize and remove duplicates
+        current_layer = set(canonicalize_circular(board) for board in raw_layer)
+
+        # Generate edges from this layer to previous layer
         for board in current_layer:
-            moves = legal_moves(board)  # all legal moves from this board
+            moves = legal_moves(board)
             for move in moves:
                 move_canonical = canonicalize_circular(move)
                 if move_canonical in prev_layer:
-                    edges_total[board].append(move_canonical)
+                    edges_total[board].add(move_canonical)  # store as set to remove duplicates
 
         # Current layer becomes previous layer for next iteration
         prev_layer = current_layer
@@ -100,21 +107,56 @@ def generate_game_graph_memory_efficient(n):
     return edges_total
 
 
-# ----------------------
-# Example usage
-# ----------------------
-if __name__ == "__main__":
-    n = 5
-    edges = generate_game_graph_memory_efficient(n)
+def save_graph(edges, filename):
+    """Save edges dict as a pickle file."""
+    with open(filename, "wb") as f:
+        pickle.dump(edges, f)
+    print(f"Graph saved to {filename}")
 
-    total_nodes = set()
-    for src, dsts in edges.items():
-        total_nodes.add(src)
-        total_nodes.update(dsts)
+def run_graph_generation(max_n=10, mem_limit_mb=2000, output_dir="graphs"):
+    """
+    Progressively generate game graphs for n=1..max_n.
+    Stops if estimated memory usage exceeds mem_limit_mb.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(exist_ok=True)
 
-    print(f"Total nodes: {len(total_nodes)}")
-    print(f"Sample edges:")
-    for i, (src, dsts) in enumerate(edges.items()):
-        print(f"{src} -> {dsts}")
-        if i >= 4:  # only show first 5 edges
+    for n in range(1, max_n + 1):
+        print(f"\n--- Generating game graph for n={n} ---")
+
+        start_time = time.time()
+        tracemalloc.start()
+
+        try:
+            edges = generate_game_graph_memory_efficient(n)
+        except MemoryError:
+            print(f"MemoryError: stopping at n={n}")
             break
+
+        current_mem, peak_mem = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        elapsed_time = time.time() - start_time
+
+        # Stop if peak memory exceeds the limit
+        if peak_mem / 1024**2 > mem_limit_mb:
+            print(f"Peak memory {peak_mem/1024**2:.1f} MB exceeded limit of {mem_limit_mb} MB")
+            break
+
+        # Save graph
+        filename = output_dir / f"game_graph_n{n}.pkl"
+        save_graph(edges, filename)
+
+        # Count unique nodes
+        total_nodes = set()
+        for src, dsts in edges.items():
+            total_nodes.add(src)
+            total_nodes.update(dsts)
+
+        # Report stats
+        print(f"Total nodes: {len(total_nodes)}")
+        print(f"Time elapsed: {elapsed_time:.2f} s")
+        print(f"Current memory: {current_mem / 1024**2:.2f} MB")
+        print(f"Peak memory: {peak_mem / 1024**2:.2f} MB")
+
+if __name__ == "__main__":
+    run_graph_generation(max_n=25, mem_limit_mb=2000)
