@@ -26,16 +26,18 @@ def find_longest_circular_runs(vec):
             if current_run == 0:
                 temp_start = i
             current_run += 1
-            if i < n:
-                if current_run > max_run:
-                    max_run = current_run
-                    start_indices = [temp_start % n]
-                elif current_run == max_run:
-                    start_indices.append(temp_start % n)
+            # Only track start_indices when the run starts in the original array
+            if current_run > max_run and i - current_run + 1 < n:
+                max_run = current_run
+                start_indices = [temp_start % n]
+            elif current_run == max_run and i - current_run + 1 < n:
+                start_indices.append(temp_start % n)
         else:
             current_run = 0
 
+    # remove duplicates just in case
     return max_run, list(set(start_indices))
+
 
 def canonicalize_circular(vec):
     vec = [int(x) for x in vec]
@@ -470,6 +472,10 @@ if __name__ == "__main__":
         print(f"  Next:     {attrs['Next']}")
         print(f"  Previous: {attrs['Previous']}")
 
+    a = (1,1,1,1,0)
+    b = (1,1,1,0,1)
+    print(canonicalize_circular(a))  # (0,1,1,1,1)
+    print(canonicalize_circular(b))  # (0,1,1,1,1)
 
     # ---------------------------------------
     # For zooming in to a specific node:
@@ -486,3 +492,5 @@ if __name__ == "__main__":
     # Plot a neighborhood of 2 layers around the chosen node
     plot_zoomed_node(nodes, edges, center_node=start_board, layers=2)
 """
+
+
