@@ -1,6 +1,6 @@
 from itertools import combinations, product
 from collections import defaultdict
-from main import is_legal, canonicalize_circular
+from main import is_legal, canonicalize_circular, legal_moves
 
 def is_partial_legal(board, i):
     # no adjacent different nonzeros
@@ -50,39 +50,71 @@ def boards_at_depth(n, depth):
     return boards
 
 
-def generate_edges(layer_lower, layer_upper):
+def generate_edges_from_layer(layer):
     """
-    Generate edges from boards at depth k-1 to boards at depth k.
-    layer_lower: set of canonical boards at depth k-1
-    layer_upper: set of canonical boards at depth k
-    Returns: dict mapping canonical lower -> list of canonical upper
-    WRONG
+    Generate edges from a layer of canonical boards by applying all legal moves.
+    Returns a dict mapping canonical board -> list of canonical boards reachable in one move.
     """
     edges = defaultdict(list)
 
-    for lower in layer_lower:
-        for upper in layer_upper:
-            # check value difference to detect new non-zero
-            diff_indices = [i for i in range(len(lower)) if lower[i] != upper[i]]
-
-            if len(diff_indices) != 1:
-                continue  # must differ at exactly one index
-
-            idx = diff_indices[0]
-            # ensure this is a 0 -> ±1 change
-            if lower[idx] != 0 or upper[idx] == 0:
-                continue
-
-            edges[lower].append(upper)
+    for board in layer:
+        # generate all legal moves from this board
+        moves = legal_moves(board)
+        for move in moves:
+            move_canonical = canonicalize_circular(move)
+            edges[board].append(move_canonical)
 
     return edges
 
 
+def generate_game_graph_memory_efficient(n):
+    """
+    Memory-efficient game graph generation.
+    Streams layers from depth n down to 0.
+    Only keeps two layers in memory at a time.
+
+    Returns:
+        edges_total: dict mapping canonical board -> list of canonical boards
+    """
+    edges_total = defaultdict(list)
+
+    # Store the previous layer
+    prev_layer = set()
+
+    # Generate the deepest layer first
+    for depth in reversed(range(n + 1)):
+        print(f"Processing depth {depth}...")
+        current_layer = boards_at_depth(n, depth)
+
+        # Build edges from current layer to previous layer
+        for board in current_layer:
+            moves = legal_moves(board)  # all legal moves from this board
+            for move in moves:
+                move_canonical = canonicalize_circular(move)
+                if move_canonical in prev_layer:
+                    edges_total[board].append(move_canonical)
+
+        # Current layer becomes previous layer for next iteration
+        prev_layer = current_layer
+
+    return edges_total
 
 
+# ----------------------
+# Example usage
+# ----------------------
 if __name__ == "__main__":
     n = 5
-    for k in range(n+1):
-        print(boards_at_depth(n, k))
+    edges = generate_game_graph_memory_efficient(n)
 
-    print(generate_edges(boards_at_depth(5,2), boards_at_depth(5,3)))
+    total_nodes = set()
+    for src, dsts in edges.items():
+        total_nodes.add(src)
+        total_nodes.update(dsts)
+
+    print(f"Total nodes: {len(total_nodes)}")
+    print(f"Sample edges:")
+    for i, (src, dsts) in enumerate(edges.items()):
+        print(f"{src} -> {dsts}")
+        if i >= 4:  # only show first 5 edges
+            break
