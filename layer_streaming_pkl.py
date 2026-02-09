@@ -54,57 +54,139 @@ def boards_at_depth(n, depth):
     return boards
 
 
+def generate_labeled_edges(source):
+    """
+    Generate all legal moves from source.
+    Returns:
+        dict: {canonical_dest: set((pos, val))}
+    """
+    n = len(source)
+    labeled_dests = defaultdict(set)
+
+    for i in range(n):
+        if source[i] != 0:
+            continue
+
+        left = source[(i - 1) % n]
+        right = source[(i + 1) % n]
+
+        for val in (1, -1):
+            # local legality check
+            if left == -val or right == -val:
+                continue
+
+            # now it's guaranteed legal
+            new_board = list(source)
+            new_board[i] = val
+
+            dest = tuple(canonicalize_circular(new_board))
+            labeled_dests[dest].add((i, val))
+
+    return labeled_dests
+
+
+
 def generate_edges_from_layer(layer):
     """
-    Generate edges from a layer of canonical boards by applying all legal moves.
-    Returns a dict mapping canonical board -> list of canonical boards reachable in one move.
-    """
-    edges = defaultdict(list)
+    Generate all labeled edges from a layer of canonical board states.
 
-    for board in layer:
-        # generate all legal moves from this board
-        moves = legal_moves(board)
-        for move in moves:
-            move_canonical = canonicalize_circular(move)
-            edges[board].append(move_canonical)
-
-    return edges
-
-
-def generate_game_graph_memory_efficient(n):
-    """
-    Memory-efficient game graph generation with deduplication after canonicalization.
-    Edges are stored as sets to avoid duplicates.
-    Streams layers from depth n down to 0.
-    Only keeps two layers in memory at a time.
+    For each source board in the given layer, this function applies all legal
+    single-move placements (+1 or -1 in a zero position), canonicalizes the
+    resulting board, and records the move(s) that produce each destination.
 
     Returns:
-        edges_total: dict mapping canonical board -> set of canonical boards
+        dict:
+            A nested dictionary of the form
+
+                edges[source][dest] = set((pos, val))
+
+            where:
+              - source is a canonical board in the input layer
+              - dest is a canonical board reachable from source in one move
+              - (pos, val) indicates that placing val ∈ {+1, -1} at index pos
+                produces dest (after canonicalization)
+
+            Multiple distinct moves may map to the same destination due to
+            rotational or sign symmetries.
     """
-    edges_total = defaultdict(set)
+    edges = defaultdict(lambda: defaultdict(set))
+
+    for source in layer:
+        move_map = generate_labeled_edges(source)
+
+        for dest, moves in move_map.items():
+            edges[source][dest].update(moves)
+
+    return {
+        source: dict(dest_map)
+        for source, dest_map in edges.items()
+    }
+
+
+def generate_game_graph_streaming(n, out_dir="graph_chunks"):
+    """
+    Memory-efficient, streaming game graph generation.
+
+    Writes edge chunks to disk layer-by-layer instead of keeping
+    the entire graph in memory.
+
+    Each file contains:
+        edges[source][dest] = set((pos, val))
+    """
+    import os
+    out_dir=f"{n}_graph_chunks"
+    os.makedirs(out_dir, exist_ok=True)
 
     prev_layer = set()
 
-    # Process layers from deepest to shallowest
     for depth in reversed(range(n + 1)):
         print(f"Processing depth {depth}...")
-        raw_layer = boards_at_depth(n, depth)
 
-        # Canonicalize and remove duplicates
-        current_layer = set(canonicalize_circular(board) for board in raw_layer)
+        current_layer = set(boards_at_depth(n, depth))
 
-        # Generate edges from this layer to previous layer
-        for board in current_layer:
-            moves = legal_moves(board)
-            for move in moves:
-                move_canonical = canonicalize_circular(move)
-                if move_canonical in prev_layer:
-                    edges_total[board].add(move_canonical)  # store as set to remove duplicates
+        layer_edges = defaultdict(lambda: defaultdict(set))
 
-        # Current layer becomes previous layer for next iteration
+        # Generate labeled edges
+        raw_edges = generate_edges_from_layer(current_layer)
+
+        for source, dest_map in raw_edges.items():
+            for dest, moves in dest_map.items():
+                if dest in prev_layer:
+                    layer_edges[source][dest].update(moves)
+
+        # Write this layer’s edges to disk
+        path = f"{out_dir}/edges_depth_{depth}.pkl"
+        with open(path, "wb") as f:
+            pickle.dump(
+                {src: dict(dests) for src, dests in layer_edges.items()},
+                f,
+                protocol=pickle.HIGHEST_PROTOCOL
+            )
+
+        # Free memory aggressively
+        del layer_edges
+        del raw_edges
+
         prev_layer = current_layer
 
-    return edges_total
+
+# -------------------------------------------------
+# To read back in the chunks:
+# -------------------------------------------------
+"""
+import pickle
+import glob
+
+edges = {}
+
+for path in sorted(glob.glob("graph_chunks/edges_depth_*.pkl")):
+    with open(path, "rb") as f:
+        chunk = pickle.load(f)
+        edges.update(chunk)
+"""
+# ---------------------------------------------------------------------------------------------------------------
+# Better: just stream chunks in during analysis, never load everything unless necessary
+# ---------------------------------------------------------------------------------------------------------------
 
 
 def save_graph(edges, filename):
