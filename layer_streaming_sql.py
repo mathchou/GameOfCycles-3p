@@ -486,7 +486,7 @@ def plot_graph_streaming_html(db_path, n, html_path="game_graph_stream.html", sa
             ))
 
         # Progressive HTML save
-        if layer % save_every_layer == 0 or layer == n:
+        if layer % save_every_layer == 4 or layer == n:
             fig.write_html(html_path)
             print(f"Saved progress to {html_path} at layer {layer}")
 
@@ -574,5 +574,5 @@ def generate_until_memory_limit(start_n=1, max_n=None, max_memory_MB=800, db_pre
 ## Example usage
 ## -------------------------------------------------------------
 if __name__ == "__main__":
-    generate_until_memory_limit(start_n=5, max_n=24, max_memory_MB=8000)
+    generate_until_memory_limit(start_n=18, max_n=24, max_memory_MB=8000)
 
