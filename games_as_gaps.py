@@ -305,8 +305,8 @@ if __name__ == "__main__":
     import sqlite3
 
     n = 1  # starting n
-    MAX_HOURS = 1
-    MAX_GB = 8
+    MAX_HOURS = 24
+    MAX_GB = 16
     output_file = "progress_log.txt"
 
     # Initialize log file

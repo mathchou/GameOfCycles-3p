@@ -427,6 +427,7 @@ import time
 import tracemalloc
 
 if __name__ == "__main__":
+
     n = 10  # set your board size here
     print(f"Generating game graph for n = {n}...")
 
@@ -482,7 +483,7 @@ if __name__ == "__main__":
     # ---------------------------------------
 
 """
-    n = 8
+    n = 9
     nodes, edges = generate_game_graph(n)
     compute_winning_strategies(nodes, edges)
 
@@ -490,7 +491,10 @@ if __name__ == "__main__":
     start_board = canonicalize_circular(tuple([0] * n))
 
     # Plot a neighborhood of 2 layers around the chosen node
-    plot_zoomed_node(nodes, edges, center_node=start_board, layers=2)
+    plot_zoomed_node(nodes, edges, center_node=start_board, layers=4)
 """
+
+
+
 
 
