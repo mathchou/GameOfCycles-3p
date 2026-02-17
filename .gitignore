@@ -81,4 +81,3 @@ venv.bak/
 dmypy.json
 
 #
-*.db
