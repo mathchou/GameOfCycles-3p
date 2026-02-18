@@ -1,0 +1,6 @@
+name: gamecycle
+channels:
+  - defaults
+dependencies:
+  - python=3.13
+prefix: C:\Users\mokec\miniconda3\envs\gamecycle

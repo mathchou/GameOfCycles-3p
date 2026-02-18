@@ -1,6 +1,7 @@
 from games_as_gaps import *
 import tkinter as tk
 import sqlite3
+import pandas as pd
 
 def parse_gaps(canonical: str):
     if not canonical:
@@ -418,48 +419,59 @@ def table_negative_gaps(db_path, max_k):
     conn.close()
 
 
-def table_double_positive_gaps(db_path, max_k, max_m):
+def table_double_positive_gaps(db_path, max_k, return_df=True):
     """
-    Generate a table of positive gaps (k, 1), (m, 1) up to max_k and max_m.
-    Prints winner tuple and winning moves.
+    Generate a table of positive gaps (k,1), (m,1).
+    Prints table and optionally returns a pandas DataFrame.
     """
 
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
-    print(f"{'Gap':>8} | {'Individual Gap Winners':>30} | {'Winner (curr,next,prev)':>25} | Winning Moves")
-    print("-" * 150)
+    rows = []
+
+    print(f"{'Gap':>12} | {'Individual Gap Winners':>30} | {'Winner (curr,next,prev)':>25} | Winning Moves")
+    print("-" * 160)
 
     for k in range(1, max_k + 1):
+
+        # --- Individual gap k ---
         gap_1 = [Gap(k, 1)]
         state_1 = GameState(gap_1)
         canonical_1 = canonical_str(state_1)
-        # Query getting individual gap data
         cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (canonical_1,))
-        gap1_winner = eval(cur.fetchone()[0])
+        gap1_row = cur.fetchone()
+        if not gap1_row:
+            continue
+        gap1_winner = eval(gap1_row[0])
+
         for m in range(1, k + 1):
+
+            # --- Individual gap m ---
             gap_2 = [Gap(m, 1)]
             state_2 = GameState(gap_2)
             canonical_2 = canonical_str(state_2)
-            # Query getting individual gap data
             cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (canonical_2,))
-            gap2_winner = eval(cur.fetchone()[0])
+            gap2_row = cur.fetchone()
+            if not gap2_row:
+                continue
+            gap2_winner = eval(gap2_row[0])
 
+            # --- Combined state ---
             gaps = [Gap(k, 1), Gap(m, 1)]
             state = GameState(gaps)
             canonical = canonical_str(state)
 
-            # Query ignoring turn
             cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (canonical,))
             row = cur.fetchone()
+
             if not row:
-                # No such gamestate exists
-                print(f"{'-' + str(k) + ', -1':>8} | {'':>30} | {'-GameState-not-found-':>25} | {'N/A'}")
+                print(f"{'+' + str(k) + ', +' + str(m):>12} | {'':>30} | {'-GameState-not-found-':>25} | {'N/A'}")
                 continue
 
             winner = eval(row[0])
 
-            # Find winning moves
+            # --- Find winning moves ---
             winning_moves = []
             for move_state in state.legal_moves():
                 move_canonical = canonical_str(move_state)
@@ -467,12 +479,30 @@ def table_double_positive_gaps(db_path, max_k, max_m):
                 move_row = cur.fetchone()
                 if move_row:
                     move_winner = eval(move_row[0])
-                    if move_winner[2] == 1:  # previous player wins → current player can force a win
+                    if move_winner[2] == 1:
                         winning_moves.append(move_canonical)
 
-            print(f"{'+' + str(k) + ', +' + str(m) :>8} | {str(gap1_winner) + ', ' + str(gap2_winner):>30} |  {str(winner):>25} | {winning_moves}")
+            gap_label = f"+{k}, +{m}"
+            individual_label = f"{gap1_winner}, {gap2_winner}"
+
+            print(f"{gap_label:>12} | {individual_label:>30} | {str(winner):>25} | {winning_moves}")
+
+            # --- Save row for DataFrame ---
+            rows.append({
+                "Gap": gap_label,
+                "Gap_k": k,
+                "Gap_m": m,
+                "Gap_k_winner": gap1_winner,
+                "Gap_m_winner": gap2_winner,
+                "Combined_winner": winner,
+                "Winning_moves": winning_moves
+            })
 
     conn.close()
+
+    if return_df:
+        df = pd.DataFrame(rows)
+        return df
 
 if __name__ == "__main__":
     #explorer = CLI_GameExplorer(n=20)
@@ -509,4 +539,4 @@ if __name__ == "__main__":
 
     # table_negative_gaps(db_path, max_k=37)
 
-    table_double_positive_gaps(db_path, max_k = 10, max_m = 10)
+    df = table_double_positive_gaps(db_path, max_k = 10, return_df = True)
