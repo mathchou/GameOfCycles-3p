@@ -333,6 +333,47 @@ def get_winner_and_moves(db_path, gaps):
     conn.close()
     return winner, winning_moves
 
+def table_positive_gaps(db_path, max_k):
+    """
+    Generate a table of positive gaps (k, 1) up to max_k.
+    Prints winner tuple and winning moves.
+    """
+
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    print(f"{'Gap':>8} | {'Winner (curr,next,prev)':>25} | Winning Moves")
+    print("-" * 80)
+
+    for k in range(1, max_k + 1):
+        gaps = [Gap(k, 1)]
+        state = GameState(gaps)
+        canonical = canonical_str(state)
+
+        # Query ignoring turn
+        cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (canonical,))
+        row = cur.fetchone()
+        if not row:
+            # No such gamestate exists
+            print(f"{'+' + str(k):>8} | {'-GameState-not-found-':>25} | {'N/A'}")
+            continue
+
+        winner = eval(row[0])
+
+        # Find winning moves
+        winning_moves = []
+        for move_state in state.legal_moves():
+            move_canonical = canonical_str(move_state)
+            cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (move_canonical,))
+            move_row = cur.fetchone()
+            if move_row:
+                move_winner = eval(move_row[0])
+                if move_winner[2] == 1:  # previous player wins → current player can force a win
+                    winning_moves.append(move_canonical)
+
+        print(f"{'+' + str(k):>8} | {str(winner):>25} | {winning_moves}")
+
+    conn.close()
 
 def table_negative_gaps(db_path, max_k):
     """
@@ -377,7 +418,61 @@ def table_negative_gaps(db_path, max_k):
     conn.close()
 
 
+def table_double_positive_gaps(db_path, max_k, max_m):
+    """
+    Generate a table of positive gaps (k, 1), (m, 1) up to max_k and max_m.
+    Prints winner tuple and winning moves.
+    """
 
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    print(f"{'Gap':>8} | {'Individual Gap Winners':>30} | {'Winner (curr,next,prev)':>25} | Winning Moves")
+    print("-" * 150)
+
+    for k in range(1, max_k + 1):
+        gap_1 = [Gap(k, 1)]
+        state_1 = GameState(gap_1)
+        canonical_1 = canonical_str(state_1)
+        # Query getting individual gap data
+        cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (canonical_1,))
+        gap1_winner = eval(cur.fetchone()[0])
+        for m in range(1, k + 1):
+            gap_2 = [Gap(m, 1)]
+            state_2 = GameState(gap_2)
+            canonical_2 = canonical_str(state_2)
+            # Query getting individual gap data
+            cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (canonical_2,))
+            gap2_winner = eval(cur.fetchone()[0])
+
+            gaps = [Gap(k, 1), Gap(m, 1)]
+            state = GameState(gaps)
+            canonical = canonical_str(state)
+
+            # Query ignoring turn
+            cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (canonical,))
+            row = cur.fetchone()
+            if not row:
+                # No such gamestate exists
+                print(f"{'-' + str(k) + ', -1':>8} | {'':>30} | {'-GameState-not-found-':>25} | {'N/A'}")
+                continue
+
+            winner = eval(row[0])
+
+            # Find winning moves
+            winning_moves = []
+            for move_state in state.legal_moves():
+                move_canonical = canonical_str(move_state)
+                cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (move_canonical,))
+                move_row = cur.fetchone()
+                if move_row:
+                    move_winner = eval(move_row[0])
+                    if move_winner[2] == 1:  # previous player wins → current player can force a win
+                        winning_moves.append(move_canonical)
+
+            print(f"{'+' + str(k) + ', +' + str(m) :>8} | {str(gap1_winner) + ', ' + str(gap2_winner):>30} |  {str(winner):>25} | {winning_moves}")
+
+    conn.close()
 
 if __name__ == "__main__":
     #explorer = CLI_GameExplorer(n=20)
@@ -410,4 +505,8 @@ if __name__ == "__main__":
         print("Winning moves:", moves)
     """
 
-    table_negative_gaps(db_path, max_k=37)
+    # table_positive_gaps(db_path, max_k=30)
+
+    # table_negative_gaps(db_path, max_k=37)
+
+    table_double_positive_gaps(db_path, max_k = 10, max_m = 10)
