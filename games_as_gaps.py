@@ -300,6 +300,7 @@ def Get_Gamegraph_and_Strategy(n):
 # MAIN
 # --------------------------
 if __name__ == "__main__":
+    """
     import time
     import tracemalloc
     import sqlite3
@@ -389,3 +390,4 @@ if __name__ == "__main__":
             break
 
         n += 1
+        """
