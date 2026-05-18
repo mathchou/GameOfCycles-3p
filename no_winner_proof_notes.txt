@@ -1,0 +1,53 @@
+Sketch of easy part of a proof that there is no winning strategy past some point
+
+If +n has strategy [0,0,0] then +(n+1) must be [x,0,x] since player 2 cannot prevent player 1 from going to the +n configuration. In fact, +(n+1) must actually be [x,0,0] because player 3 can't stop player 1 from going to +n. 
+
+So only need to consider if (first to play on gap game) = (player 2) has a winning strategy.
+
+-----
+the above argument works for ANY configuration that has a path to a [0,0,0] node.
+
++n,+1 must be [x,0,0] since Next and Previous can't prevent Current from going to +n, where nobody has a winning strategy.
+
+[Current, Next, Previous]
+[Next, NextNext, Previous]
+
+Okay, so let's look at all the nodes that are [0,0,0]
+
+HOPE: at some layer k, there are enough [0,0,0] nodes so that their "preimage" covers the layer before (k-1). Then, the entire layer before has to be [x,0,0], since there's always an option for that player to go to a [0,0,0] node.
+
+that means that for all choices from layer k-2, the strategy is leads to is [x,0,0] and so ...
+
+-----
+
+With gap visualization, it encodes the end of ANY game of ANY size.
+
+So, we have hope of being able to prove there is NO winning strategy for any player past some value.
+
+-----
+
+
+From game tree at n = N+1 there are ways to stay out of positions generated in game tree for n = N (as long as player doesn't meld), but we can't *stop* a player from forcing back into one via melding. In fact, we can have 2 players collude to show there is no winning strategy for the other. Can look 2 ahead for no winner node.
+
+Define property *
+	- A layer has property * if for all nodes in the layer, there exists a child node with winning strategy [0,0,0]. That is, nobody can win from this position.
+
+Suppose at k=K we have our * property. Then at +(K+2) any P1-move to layer k = K+1 can be melded into the previous +(K+1) game tree by P2-move. This in in time have P3-move to a node with no winning strategy.
+
+Therefore if we find at k = K the * property via searching from game K+1, then player 1 at +(K+2) has no winning strategy.
+
+Q: If we find a set of three columns with the * property in a row, does that mean that there is no winner for P1, P2, or P3?
+
+
+
+see games_as_gaps.py
+  - filter_nodes_with_target_child()
+    # for k in range(6):
+    #     filter_nodes_with_target_child(n=43,layer=k)
+    ## Layer 0: 1 / 1 nodes have a terminal child with winner [0, 0, 0]
+    ## Layer 1: 43 / 43 nodes have a terminal child with winner [0, 0, 0]
+    ## Layer 2: 581 / 581 nodes have a terminal child with winner [0, 0, 0]
+    ## Layer 3: 3980 / 3980 nodes have a terminal child with winner [0, 0, 0]
+    ## Layer 4: 16469 / 16469 nodes have a terminal child with winner [0, 0, 0]
+    ## Layer 5: 46814 / 46829 nodes have a terminal child with winner [0, 0, 0]
+so in particular layers 1, 2, 3, and 4 all satisfy property *

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import List, Tuple
 import sqlite3
 import os
+import json
 
 # --------------------------
 # GAP CLASS
@@ -30,6 +31,8 @@ class Gap:
         if self.size >= 3:
             for a in range(1, self.size - 1):
                 b = self.size - 1 - a
+                # Positive gaps split into two same-orientation children.
+                # Negative gaps split asymmetrically: one child of each orientation.
                 type_pairs = [(1,1), (-1,-1)] if self.orientation == 1 else [(1,-1), (-1,1)]
                 for tL, tR in type_pairs:
                     moves.append((Gap(a, tL), Gap(b, tR)))
@@ -47,6 +50,7 @@ class Gap:
 class GameState:
     def __init__(self, gaps: List[Gap], turn: int = 0):
         gaps_list = [g if isinstance(g, Gap) else Gap(*g) for g in gaps]
+        # Sort by size descending, then orientation descending (+1 before -1)
         self.gaps = sorted(gaps_list, key=lambda g: (-g.size, -g.orientation))
         self.turn = turn % 3
 
@@ -133,33 +137,42 @@ def insert_layer(states: List[GameState], layer_num: int, cur, conn):
 def bfs_store_sql_resume(root_state: GameState, cur, conn):
     seen = reconstruct_seen(cur)
 
-    # Find last processed layer
     cur.execute("SELECT MAX(layer) FROM gamestates")
     result = cur.fetchone()
-    last_layer_num = result[0] if result[0] is not None else -1
+    max_layer = result[0] if result[0] is not None else -1
 
-    # Initialize current layer
-    if last_layer_num == -1:
+    if max_layer == -1:
+        # Fresh start
         current_layer = [root_state]
         layer_num = 0
     else:
-        # Load last layer from DB
-        cur.execute("SELECT canonical, turn FROM gamestates WHERE layer=?", (last_layer_num,))
+        # Check if max_layer was fully expanded by seeing if max_layer+1 exists
+        cur.execute("SELECT COUNT(*) FROM gamestates WHERE layer=?", (max_layer + 1,))
+        next_layer_exists = cur.fetchone()[0] > 0
+
+        if next_layer_exists:
+            # max_layer was fully expanded; resume from max_layer+1
+            resume_layer = max_layer + 1
+        else:
+            # max_layer may be incomplete; roll back and re-expand from max_layer-1
+            cur.execute("DELETE FROM gamestates WHERE layer=?", (max_layer,))
+            conn.commit()
+            seen = reconstruct_seen(cur)  # rebuild seen after deletion
+            resume_layer = max_layer  # will re-expand layer max_layer-1 into it
+
+        cur.execute("SELECT canonical, turn FROM gamestates WHERE layer=?", (resume_layer - 1,))
         rows = cur.fetchall()
         current_layer = []
-        for r in rows:
-            if not r[0]:
-                gaps = []
-            else:
-                gaps = []
-                for g in r[0].split(','):
-                    if not g:
-                        continue
-                    orientation = 1 if g[0] == '+' else -1
-                    size = int(g[1:])
-                    gaps.append(Gap(size, orientation))
-            current_layer.append(GameState(gaps, r[1]))
-        layer_num = last_layer_num + 1
+        for canonical, turn in rows:
+            gaps = []
+            for g in (canonical or "").split(','):
+                if not g:
+                    continue
+                orientation = 1 if g[0] == '+' else -1
+                size = int(g[1:])
+                gaps.append(Gap(size, orientation))
+            current_layer.append(GameState(gaps, turn))
+        layer_num = resume_layer
 
     # BFS loop
     while current_layer:
@@ -246,7 +259,7 @@ def compute_misere_winners(n: int):
                     row = cur.fetchone()
                     if row and row[0]:
                         # Convert string back to list
-                        child_statuses.append(eval(row[0]))
+                        child_statuses.append(json.loads(row[0]))
                     else:
                         # If child not yet computed, assume neutral [0,0,0]
                         child_statuses.append([0,0,0])
@@ -263,7 +276,7 @@ def compute_misere_winners(n: int):
             # Store in DB as string
             cur.execute(
                 "UPDATE gamestates SET winner=? WHERE canonical=? AND turn=?",
-                (str(winner), canonical, turn)
+                (json.dumps(winner), canonical, turn)
             )
 
         conn.commit()
@@ -295,6 +308,72 @@ def Get_Gamegraph_and_Strategy(n):
     cur.execute("SELECT winner FROM gamestates WHERE layer=0")
     print("Root state winner:", cur.fetchone()[0])
     conn.close()
+
+
+
+def filter_nodes_with_target_child(n: int, layer: int, target_winner: list = [0, 0, 0]) -> List[GameState]:
+    """
+    For each node in `layer`, check if any child is terminal with the given winner value.
+    Returns the list of parent nodes where such a child exists.
+    """
+    conn, cur = get_db_connection(n)
+    target_str = json.dumps(target_winner)
+
+    # Load all nodes in the given layer
+    cur.execute("SELECT canonical, turn FROM gamestates WHERE layer=?", (layer,))
+    rows = cur.fetchall()
+
+    matching_parents = []
+
+    for canonical, turn in rows:
+        # Reconstruct parent state
+        gaps = []
+        for g in (canonical or "").split(','):
+            if not g:
+                continue
+            orientation = 1 if g[0] == '+' else -1
+            size = int(g[1:])
+            gaps.append(Gap(size, orientation))
+        state = GameState(gaps, turn)
+
+        # Check each child
+        for child in state.legal_moves():
+            child_canonical = canonical_str(child)
+            cur.execute(
+                "SELECT winner, layer FROM gamestates WHERE canonical=? AND turn=?",
+                (child_canonical, child.turn)
+            )
+            row = cur.fetchone()
+            if row is None:
+                continue
+            child_winner, child_layer = row
+
+            # Check: terminal (layer+1 has no children, i.e. child is in max layer or is_terminal)
+            # We use child.is_terminal() since we have the object already
+            if child_winner == target_str:
+                matching_parents.append(state)
+                break  # no need to check further children
+
+    conn.close()
+    print(f"Layer {layer}: {len(matching_parents)} / {len(rows)} nodes have a terminal child with winner {target_winner}")
+    return matching_parents
+
+    # Example usage:
+    # for k in range(6):
+    #     filter_nodes_with_target_child(n=43,layer=k)
+    ## Layer 0: 1 / 1 nodes have a terminal child with winner [0, 0, 0]
+    ## Layer 1: 43 / 43 nodes have a terminal child with winner [0, 0, 0]
+    ## Layer 2: 581 / 581 nodes have a terminal child with winner [0, 0, 0]
+    ## Layer 3: 3980 / 3980 nodes have a terminal child with winner [0, 0, 0]
+    ## Layer 4: 16469 / 16469 nodes have a terminal child with winner [0, 0, 0]
+    ## Layer 5: 46814 / 46829 nodes have a terminal child with winner [0, 0, 0]
+
+
+
+
+
+
+
 
 # --------------------------
 # MAIN

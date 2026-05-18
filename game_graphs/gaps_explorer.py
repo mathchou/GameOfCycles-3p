@@ -507,8 +507,8 @@ def table_double_positive_gaps(db_path, max_k, return_df=True):
 if __name__ == "__main__":
     #explorer = CLI_GameExplorer(n=20)
     #explorer.explore("+20", 0)
-    #explorer = VisualGameExplorer(n=20)
-    #explorer.start("+20", 0)
+    explorer = VisualGameExplorer(n=20)
+    explorer.start("+20", 0)
 
 
     db_path = "gamestates_n39.db"
@@ -539,4 +539,4 @@ if __name__ == "__main__":
 
     # table_negative_gaps(db_path, max_k=37)
 
-    df = table_double_positive_gaps(db_path, max_k = 10, return_df = True)
+    # df = table_double_positive_gaps(db_path, max_k = 10, return_df = True)

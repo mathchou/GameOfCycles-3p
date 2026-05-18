@@ -6,6 +6,9 @@ __pycache__/
 # Pickled Objects
 *.pkl
 
+# SQL db
+*.db
+
 # C extensions
 *.so
 

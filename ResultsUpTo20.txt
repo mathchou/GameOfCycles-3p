@@ -219,7 +219,7 @@ Total nodes: 2187217
 Time elapsed: 494.734 seconds
 Current memory usage: 7726.927 MB
 Peak memory usage: 7744.802 MB
-Starting board: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+Starting board: [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 Winning strategy at start:
   Current:  False
   Next:     True
