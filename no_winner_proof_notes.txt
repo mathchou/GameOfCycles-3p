@@ -51,3 +51,13 @@ see games_as_gaps.py
     ## Layer 4: 16469 / 16469 nodes have a terminal child with winner [0, 0, 0]
     ## Layer 5: 46814 / 46829 nodes have a terminal child with winner [0, 0, 0]
 so in particular layers 1, 2, 3, and 4 all satisfy property *
+
+-----
+
+Hold on, we need it to be for every possible partition at a layer k. The reason is as follows:
+
+for very large games, we can't conclude that it will get all the way into one of the nodes we calculated unless we have confirmed that we have every possible position at layer k=K. This means every signed partition of K with even parity.
+
+If we have that, then we can be sure that there is no winning strategy.
+
+Moreover, we can actually relax the condition that the terminal node is [0,0,0]. As long as the node is [0,x,x] we know that the player whose turn it is at the terminal node doesn't have a winning strategy.

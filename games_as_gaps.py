@@ -1,16 +1,19 @@
 from dataclasses import dataclass
 from typing import List, Tuple
+from itertools import product, groupby
 import sqlite3
 import os
 import json
+import time
+import tracemalloc
 
 # --------------------------
 # GAP CLASS
 # --------------------------
-@dataclass
 class Gap:
-    size: int
-    orientation: int   # +1 or -1
+    def __init__(self, size: int, orientation: int):
+        self.size = size
+        self.orientation = orientation # +1 or -1
 
     def is_dead(self) -> bool:
         return self.orientation == -1 and self.size == 1
@@ -88,16 +91,79 @@ def canonical_str(state: GameState) -> str:
         return ''  # empty state
     return ",".join(f"{'+' if g.orientation == 1 else '-'}{g.size}" for g in state.gaps)
 
+# ----------------------------------------------------
+# Generating all game-states at a particular layer
+# ----------------------------------------------------
+
+def partitions(n):
+    """setting up all partitions of a number n"""
+    def helper(n, max_val):
+        if n == 0:
+            yield ()
+            return
+        for i in range(min(n, max_val), 0, -1):
+            for rest in helper(n - i, i):
+                yield (i,) + rest
+    return list(helper(n, n))
+
+# we can save time by doing this (from Claude):
+# 1. Generate only canonical orientations directly
+# Instead of generating all orientations and deduplicating, only generate orientations that are already in canonical
+# order for a given partition. For a partition like (3, 3, 2), the two size-3 parts are interchangeable, so you only
+# need orientations where the first + comes before the first - among equal-sized parts.
+# This eliminates duplicates at the source rather than filtering them out after.
+#
+# How to do this?
+# The insight is that we only need to generate non-increasing orientation sequences within groups of equal parts, this
+# eliminates duplicates at the source
+
+def canonical_orientations(partition):
+    groups = [(val, sum(1 for _ in grp)) for val, grp in groupby(partition)]
+    def group_options(m):
+        for j in range(m + 1):
+            yield (1,) * (m - j) + (-1,) * j
+    for combo in product(*[group_options(m) for _, m in groups]):
+        orientations = sum(combo, ())
+        if orientations.count(-1) % 2 == 0:
+            yield orientations
+
+def signed_partitions(n):
+    result = []
+    for partition in partitions(n):
+        for orientations in canonical_orientations(partition):
+            gaps = [Gap(size, ori) for size, ori in zip(partition, orientations)]
+            result.append(GameState(gaps))
+    return result
+
+def signed_partitions_gen(n):
+    for partition in partitions(n):
+        for orientations in canonical_orientations(partition):
+            gaps = [Gap(size, ori) for size, ori in zip(partition, orientations)]
+            yield GameState(gaps)
 
 # --------------------------
 # DATABASE SETUP
 # --------------------------
+def parse_gaps(canonical: str) -> List[Gap]:
+    if not canonical:
+        return []
+    gaps = []
+    for g in canonical.split(','):
+        if not g:
+            continue
+        orientation = 1 if g[0] == '+' else -1
+        size = int(g[1:])
+        gaps.append(Gap(size, orientation))
+    return gaps
+
 def get_db_connection(n: int):
     db_name = os.path.join(os.getcwd(), f"gamestates_n{n}.db")
     conn = sqlite3.connect(db_name)
     cur = conn.cursor()
 
-    # Ensure table exists
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-64000")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS gamestates (
@@ -105,10 +171,25 @@ def get_db_connection(n: int):
         canonical TEXT NOT NULL,
         turn INTEGER NOT NULL,
         layer INTEGER,
-        winner TEXT,   -- stores [curr, next, prev] as string
+        winner TEXT,
         UNIQUE(canonical, turn)
     )
     """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS edges (
+        parent_canonical TEXT NOT NULL,
+        parent_turn INTEGER NOT NULL,
+        child_canonical TEXT NOT NULL,
+        child_turn INTEGER NOT NULL,
+        PRIMARY KEY (parent_canonical, parent_turn, child_canonical, child_turn)
+    )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_edges_parent ON edges (parent_canonical, parent_turn)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_edges_child ON edges (child_canonical, child_turn)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_gamestates_layer ON gamestates (layer)")
+
     conn.commit()
     return conn, cur
 
@@ -119,21 +200,161 @@ def reconstruct_seen(cur):
 
 
 def insert_layer(states: List[GameState], layer_num: int, cur, conn):
+    state_rows = []
+    edge_rows = []
+    children = []
+    seen_children = set()
+
     for state in states:
         canonical = canonical_str(state)
-        try:
-            cur.execute(
-                "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
-                (canonical, state.turn, layer_num)
-            )
-        except sqlite3.IntegrityError:
-            pass
+        state_rows.append((canonical, state.turn, layer_num))
+        for child in state.legal_moves():
+            child_canonical = canonical_str(child)
+            edge_rows.append((canonical, state.turn, child_canonical, child.turn))
+            key = (child_canonical, child.turn)
+            if key not in seen_children:
+                seen_children.add(key)
+                children.append(child)
+
+    cur.executemany(
+        "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
+        state_rows
+    )
+    cur.executemany(
+        "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
+        edge_rows
+    )
     conn.commit()
+    return children
 
 
-# --------------------------
-# BFS LAYER-BY-LAYER WITH PAUSE/RESUME
-# --------------------------
+# ------------------------------------------------------------------------------
+# BUILD ALL POSSIBLE GAME STATES (full game tree, not just from one starting node)
+# ------------------------------------------------------------------------------
+
+def build_game_tree(n: int, chunk_size: int = 50000):
+    import time
+    conn, cur = get_db_connection(n)
+    total_start = time.time()
+    layer_num = 0
+
+    # Layer 0: stream from generator, flush to DB in chunks
+    print(f"Layer 0: streaming signed partitions...")
+    layer_start = time.time()
+    state_rows = []
+    edge_rows = []
+    total_states = 0
+
+    for state in signed_partitions_gen(n):
+        canonical = canonical_str(state)
+        state_rows.append((canonical, state.turn, layer_num))
+        for child in state.legal_moves():
+            child_canonical = canonical_str(child)
+            edge_rows.append((canonical, state.turn, child_canonical, child.turn))
+        total_states += 1
+
+        if len(state_rows) >= chunk_size:
+            cur.executemany(
+                "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
+                state_rows
+            )
+            cur.executemany(
+                "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
+                edge_rows
+            )
+            conn.commit()
+            state_rows = []
+            edge_rows = []
+            print(f"  flushed {total_states} states...", flush=True)
+
+    # Flush remainder
+    if state_rows:
+        cur.executemany(
+            "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
+            state_rows
+        )
+        cur.executemany(
+            "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
+            edge_rows
+        )
+        conn.commit()
+
+    layer_time = time.time() - layer_start
+    print(f"Layer 0: {total_states} states | {layer_time:.2f}s")
+
+    # Remaining layers: read from DB, expand, write children to DB
+    layer_num = 1
+    while True:
+        # Read all states from previous layer
+        cur.execute(
+            "SELECT canonical, turn FROM gamestates WHERE layer=?",
+            (layer_num - 1,)
+        )
+        prev_rows = cur.fetchall()
+        if not prev_rows:
+            break
+
+        # Expand children via edges table — no need to recompute legal_moves
+        cur.execute(
+            """SELECT DISTINCT e.child_canonical, e.child_turn
+               FROM edges e
+               JOIN gamestates g ON g.canonical = e.parent_canonical AND g.turn = e.parent_turn
+               WHERE g.layer = ?""",
+            (layer_num - 1,)
+        )
+        child_rows = cur.fetchall()
+
+        if not child_rows:
+            break
+
+        layer_start = time.time()
+        print(f"Layer {layer_num}: {len(child_rows)} states", end="", flush=True)
+
+        # Insert children as new layer, their edges already exist from parent expansion
+        cur.executemany(
+            "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
+            [(c, t, layer_num) for c, t in child_rows]
+        )
+        conn.commit()
+
+        # Now expand children's edges
+        state_rows = []
+        edge_rows = []
+        for child_canonical, child_turn in child_rows:
+            gaps = parse_gaps(child_canonical)
+            state = GameState(gaps, child_turn)
+            for grandchild in state.legal_moves():
+                gc_canonical = canonical_str(grandchild)
+                edge_rows.append((child_canonical, child_turn, gc_canonical, grandchild.turn))
+            state_rows.append((child_canonical, child_turn, layer_num))
+
+            if len(edge_rows) >= chunk_size * 10:
+                cur.executemany(
+                    "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
+                    edge_rows
+                )
+                conn.commit()
+                edge_rows = []
+
+        if edge_rows:
+            cur.executemany(
+                "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
+                edge_rows
+            )
+            conn.commit()
+
+        layer_time = time.time() - layer_start
+        total_time = time.time() - total_start
+        print(f" | layer: {layer_time:.2f}s | total: {total_time:.2f}s")
+
+        layer_num += 1
+
+    print(f"Done. {layer_num} layers total in {time.time() - total_start:.2f}s.")
+    conn.close()
+
+# ------------------------------------------------------------------------------
+# (OLD) BFS LAYER-BY-LAYER WITH PAUSE/RESUME - creating game tree from single node
+# ------------------------------------------------------------------------------
 def bfs_store_sql_resume(root_state: GameState, cur, conn):
     seen = reconstruct_seen(cur)
 
@@ -203,66 +424,47 @@ def compute_misere_winners(n: int):
 
     Misère rule: last move loses.
     """
-    import sqlite3
-
-    # Connect to DB
     db_name = f"gamestates_n{n}.db"
     conn = sqlite3.connect(db_name)
     cur = conn.cursor()
 
-    # Get max layer to work backwards
     cur.execute("SELECT MAX(layer) FROM gamestates")
     max_layer = cur.fetchone()[0]
 
     print(f"Computing misère winners from layer {max_layer} → 0...")
 
-    # Helper to parse canonical string back to gaps
-    def parse_gaps(canonical: str) -> List[Gap]:
-        if not canonical:
-            return []
-        gaps = []
-        for g in canonical.split(','):
-            if not g:
-                continue
-            orientation = 1 if g[0] == '+' else -1
-            size = int(g[1:])
-            gaps.append(Gap(size, orientation))
-        return gaps
-
-    # Process layers from deepest to root
     for layer in reversed(range(max_layer + 1)):
         cur.execute("SELECT canonical, turn FROM gamestates WHERE layer=?", (layer,))
         rows = cur.fetchall()
         print(f"Processing layer {layer}, {len(rows)} states")
 
         for canonical, turn in rows:
-            gaps = parse_gaps(canonical)
-            state = GameState(gaps, turn)
+            state = GameState(parse_gaps(canonical), turn)
 
             if state.is_terminal():
                 # Terminal state: last move loses
-                curr = 1          # current player cannot move
-                nextp = 1         # next player wins
-                prev = 0          # previous player cannot move next
-                winner = [curr, nextp, prev]
+                winner = [1, 1, 0]
             else:
+                # Fetch all children via edges table
                 # Non-terminal: get child winners
-                children = state.legal_moves()
-                child_statuses = []
+                cur.execute(
+                    """SELECT child_canonical, child_turn FROM edges
+                       WHERE parent_canonical=? AND parent_turn=?""",
+                    (canonical, turn)
+                )
+                child_rows = cur.fetchall()
 
-                for child in children:
-                    key = (canonical_str(child), child.turn)
+                child_statuses = []
+                for child_canonical, child_turn in child_rows:
                     cur.execute(
                         "SELECT winner FROM gamestates WHERE canonical=? AND turn=?",
-                        (key[0], key[1])
+                        (child_canonical, child_turn)
                     )
                     row = cur.fetchone()
                     if row and row[0]:
-                        # Convert string back to list
                         child_statuses.append(json.loads(row[0]))
                     else:
-                        # If child not yet computed, assume neutral [0,0,0]
-                        child_statuses.append([0,0,0])
+                        child_statuses.append([0, 0, 0])
 
                 # Apply 3-player misère propagation
                 # prev = all children next
@@ -273,7 +475,6 @@ def compute_misere_winners(n: int):
                 next_val = int(all(c[0] for c in child_statuses))
                 winner = [curr_val, next_val, prev_val]
 
-            # Store in DB as string
             cur.execute(
                 "UPDATE gamestates SET winner=? WHERE canonical=? AND turn=?",
                 (json.dumps(winner), canonical, turn)
@@ -283,6 +484,8 @@ def compute_misere_winners(n: int):
 
     print("Finished computing misère winners.")
     conn.close()
+
+
 
 def Get_Gamegraph_and_Strategy(n):
     conn, cur = get_db_connection(n)
@@ -369,8 +572,48 @@ def filter_nodes_with_target_child(n: int, layer: int, target_winner: list = [0,
     ## Layer 5: 46814 / 46829 nodes have a terminal child with winner [0, 0, 0]
 
 
+# ------------------------------------------------------------------------------
+# Querying nodes with grandchildren [0,x,x] fully in SQL to save memory/time
+# ------------------------------------------------------------------------------
 
+def check_grandchildren_winners_sql(n: int, layer: int):
+    conn, cur = get_db_connection(n)
 
+    grandchild_layer = layer + 2
+
+    cur.execute("""
+        SELECT canonical, turn
+        FROM gamestates
+        WHERE layer = ?
+        AND (canonical, turn) NOT IN (
+            SELECT DISTINCT e.parent_canonical, e.parent_turn
+            FROM edges e
+            WHERE (e.child_canonical, e.child_turn) IN (
+                SELECT DISTINCT e2.parent_canonical, e2.parent_turn
+                FROM edges e2
+                WHERE (e2.child_canonical, e2.child_turn) IN (
+                    SELECT canonical, turn
+                    FROM gamestates
+                    WHERE layer = ?
+                    AND json_extract(winner, '$[0]') = 0
+                )
+            )
+        )
+    """, (layer, grandchild_layer))
+
+    missing = cur.fetchall()
+
+    cur.execute("SELECT COUNT(*) FROM gamestates WHERE layer=?", (layer,))
+    total = cur.fetchone()[0]
+
+    conn.close()
+
+    print(f"Layer {layer}: {total - len(missing)}/{total} states have a grandchild with winner[0]==0")
+    if missing:
+        print(f"  {len(missing)} states do NOT:")
+        #for canonical, turn in missing:
+        #    print(f"    {canonical} turn={turn}")
+    return missing
 
 
 
