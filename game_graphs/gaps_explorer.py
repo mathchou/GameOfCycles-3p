@@ -3,6 +3,10 @@ import tkinter as tk
 import sqlite3
 import json
 import pandas as pd
+import os
+
+DB_DIR = "S:\\GameOfCycles-3p"
+
 
 
 class CLI_GameExplorer:
@@ -99,8 +103,7 @@ class VisualGameExplorer:
         self.root.state("zoomed")
         self.highlight_enabled = tk.BooleanVar(self.root, value=True)
         self.n = n
-
-        self.db = f"gamestates_n{n}_reduced.db"
+        self.db = os.path.join(DB_DIR, f"gamestates_n{n}_v2.db")
         self.conn = sqlite3.connect(self.db)
         self.cur = self.conn.cursor()
 
@@ -165,9 +168,9 @@ class VisualGameExplorer:
             x += BLOCK_SPACING
 
         # Draw inevitable moves as a grey number at the end
-        if inevitable_moves > 0:
+        if inevitable_moves > -1:
             self.canvas.create_text(
-                x + 20, 10 + BLOCK_HEIGHT // 2,
+                x + 60, 10 + BLOCK_HEIGHT // 2,
                 text=f"+{inevitable_moves} inevitable",
                 font=("Arial", 10),
                 fill="grey"
@@ -263,14 +266,34 @@ class VisualGameExplorer:
             previous = self.history.pop()
             self.display_state(previous)
 
-    def start(self, start_canonical, start_turn=0):
-        state = self.load_state(start_canonical, start_turn)
+    def start(self, size: int, orientation: int = 1, start_turn: int = 0):
+        canonical = find_start_canonical(self.cur, size, orientation)
+        if not canonical:
+            return
+        print(f"Starting at canonical: {canonical}")
+        state = self.load_state(canonical, start_turn)
         if state:
             self.display_state(state)
             self.root.mainloop()
         else:
             print("Start state not found.")
 
+def find_start_canonical(cur, size: int, orientation: int = 1):
+    """Find the canonical string for a single gap of given size and orientation."""
+    cur.execute(
+        "SELECT canonical, turn, layer FROM gamestates WHERE canonical LIKE ? AND turn=0",
+        (f"{'+' if orientation == 1 else '-'}{size}%",)
+    )
+    rows = cur.fetchall()
+    if not rows:
+        print(f"No state found for gap {'+' if orientation==1 else '-'}{size}")
+        return None
+    if len(rows) > 1:
+        print(f"Multiple matches found:")
+        for row in rows:
+            print(f"  {row}")
+        return None
+    return rows[0][0]
 
 def get_winner_and_moves(db_path, gaps):
     gaps_list = [g if isinstance(g, Gap) else Gap(*g) for g in gaps]
@@ -459,5 +482,5 @@ def table_double_positive_gaps(db_path, max_k, return_df=True):
 
 
 if __name__ == "__main__":
-    explorer = VisualGameExplorer(n=42)
-    explorer.start("+42", 0)
+    explorer = VisualGameExplorer(n=26)
+    explorer.start(26)  # looks up +26 automatically

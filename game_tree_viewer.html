@@ -1,0 +1,471 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Game Tree Viewer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #0f1117;
+    color: #e2e8f0;
+    font-family: 'Courier New', monospace;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    background: #1a1d27;
+    border-bottom: 1px solid #2d3148;
+    flex-shrink: 0;
+    flex-wrap: wrap;
+  }
+
+  #toolbar h1 {
+    font-size: 14px;
+    font-weight: 600;
+    color: #7c85f5;
+    letter-spacing: 0.05em;
+    margin-right: 8px;
+  }
+
+  .ctrl-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .ctrl-group label {
+    font-size: 11px;
+    color: #8891a8;
+  }
+
+  input[type=number] {
+    width: 60px;
+    background: #252836;
+    border: 1px solid #3a3f5c;
+    color: #e2e8f0;
+    padding: 4px 6px;
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 12px;
+  }
+
+  button {
+    background: #3d4fd6;
+    color: #fff;
+    border: none;
+    padding: 5px 14px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    transition: background 0.15s;
+  }
+
+  button:hover { background: #5162e8; }
+
+  #legend {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-left: auto;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: #8891a8;
+  }
+
+  .legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+  }
+
+  #main {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  #graph-container {
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+  }
+
+  svg {
+    width: 100%;
+    height: 100%;
+  }
+
+  #sidebar {
+    width: 280px;
+    background: #1a1d27;
+    border-left: 1px solid #2d3148;
+    padding: 16px;
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+
+  #sidebar h2 {
+    font-size: 12px;
+    color: #7c85f5;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 12px;
+  }
+
+  .info-row {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    padding: 4px 0;
+    border-bottom: 1px solid #1e2235;
+  }
+
+  .info-label { color: #8891a8; }
+  .info-val { color: #e2e8f0; font-weight: 600; }
+
+  .winner-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    margin-top: 8px;
+  }
+
+  .section-title {
+    font-size: 11px;
+    color: #8891a8;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin: 12px 0 6px;
+  }
+
+  .child-item {
+    font-size: 11px;
+    padding: 4px 8px;
+    background: #252836;
+    border-radius: 3px;
+    margin-bottom: 3px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: border-color 0.1s;
+    word-break: break-all;
+  }
+
+  .child-item:hover { border-color: #7c85f5; }
+
+  #status {
+    font-size: 11px;
+    color: #8891a8;
+    padding: 6px 0;
+  }
+
+  .node { cursor: pointer; }
+
+  .node circle {
+    stroke-width: 1.5px;
+    transition: r 0.1s;
+  }
+
+  .node:hover circle { stroke-width: 3px; }
+
+  .node.selected circle { stroke-width: 3px; stroke: #fff !important; }
+
+  .link {
+    fill: none;
+    stroke: #2d3555;
+    stroke-width: 1px;
+    stroke-opacity: 0.6;
+  }
+
+  .link.highlighted {
+    stroke: #7c85f5;
+    stroke-opacity: 1;
+    stroke-width: 1.5px;
+  }
+
+  .layer-label {
+    fill: #3a3f5c;
+    font-size: 11px;
+    font-family: 'Courier New', monospace;
+  }
+
+  #empty-msg {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    color: #3a3f5c;
+    font-size: 14px;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>GAME TREE</h1>
+  <div class="ctrl-group">
+    <label>Min layer</label>
+    <input type="number" id="min-layer" value="0" min="0">
+  </div>
+  <div class="ctrl-group">
+    <label>Max layer</label>
+    <input type="number" id="max-layer" value="8" min="0">
+  </div>
+  <button id="load-btn">Load</button>
+  <div id="status">Ready</div>
+  <div id="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:#4ade80"></div>curr wins</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#60a5fa"></div>next wins</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#f472b6"></div>prev wins</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#facc15"></div>mixed</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#475569"></div>unknown</div>
+  </div>
+</div>
+
+<div id="main">
+  <div id="graph-container">
+    <svg id="svg">
+      <defs>
+        <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+          <path d="M0,0 L0,6 L6,3 z" fill="#2d3555"/>
+        </marker>
+      </defs>
+      <g id="root"></g>
+    </svg>
+    <div id="empty-msg">Load a layer range to begin</div>
+  </div>
+
+  <div id="sidebar">
+    <h2>Node Inspector</h2>
+    <div id="node-info"><div style="color:#3a3f5c;font-size:12px">Click a node to inspect</div></div>
+  </div>
+</div>
+
+<script>
+const API = "http://localhost:8765";
+let currentData = null;
+let selectedNode = null;
+
+// Color by winner tuple
+function nodeColor(winner) {
+  if (!winner) return "#475569";
+  const [c, n, p] = winner;
+  if (c === 0 && n === 1 && p === 1) return "#4ade80";  // curr loses → curr wins? No: [curr,next,prev] where 1=wins
+  // Actually: winner[i]=1 means player i wins
+  // curr=winner[0], next=winner[1], prev=winner[2]
+  if (c === 1 && n === 0 && p === 0) return "#4ade80";  // only curr wins
+  if (c === 0 && n === 1 && p === 0) return "#60a5fa";  // only next wins
+  if (c === 0 && n === 0 && p === 1) return "#f472b6";  // only prev wins
+  if (c === 1 && n === 1 && p === 0) return "#a78bfa";
+  if (c === 1 && n === 0 && p === 1) return "#fb923c";
+  if (c === 0 && n === 1 && p === 1) return "#34d399";
+  return "#facc15"; // multiple or other
+}
+
+function winnerLabel(winner) {
+  if (!winner) return "unknown";
+  return `[${winner.join(", ")}]`;
+}
+
+function winnerBg(winner) {
+  if (!winner) return "#334155";
+  const c = nodeColor(winner);
+  return c;
+}
+
+async function loadTree() {
+  const minL = parseInt(document.getElementById("min-layer").value);
+  const maxL = parseInt(document.getElementById("max-layer").value);
+  document.getElementById("status").textContent = "Loading...";
+  document.getElementById("empty-msg").style.display = "none";
+
+  try {
+    const res = await fetch(`${API}/api/tree?min_layer=${minL}&max_layer=${maxL}`);
+    const data = await res.json();
+    currentData = data;
+    document.getElementById("status").textContent =
+      `${data.nodes.length} nodes, ${data.edges.length} edges`;
+    renderTree(data);
+  } catch (e) {
+    document.getElementById("status").textContent = "Error: is the server running?";
+    document.getElementById("empty-msg").style.display = "block";
+    document.getElementById("empty-msg").textContent = "Could not connect to server at localhost:8765";
+  }
+}
+
+function renderTree(data) {
+  const svg = d3.select("#svg");
+  const root = d3.select("#root");
+  root.selectAll("*").remove();
+
+  const W = document.getElementById("graph-container").offsetWidth;
+  const H = document.getElementById("graph-container").offsetHeight;
+
+  // Group nodes by layer
+  const layerMap = d3.group(data.nodes, d => d.layer);
+  const layers = Array.from(layerMap.keys()).sort((a,b) => a - b);
+
+  const colW = Math.max(180, W / (layers.length + 1));
+  const margin = { top: 40, left: 60 };
+
+  // Position nodes: x = layer * colW, y = evenly spaced within layer
+  const nodePos = {};
+  layers.forEach((layer, li) => {
+    const nodesInLayer = layerMap.get(layer);
+    const rowH = Math.max(20, Math.min(60, (H - margin.top * 2) / nodesInLayer.length));
+    nodesInLayer.forEach((node, ni) => {
+      nodePos[node.id] = {
+        x: margin.left + li * colW,
+        y: margin.top + ni * rowH + rowH / 2
+      };
+    });
+  });
+
+  // Total canvas size
+  const totalW = margin.left + layers.length * colW + 100;
+  const totalH = Math.max(H, margin.top * 2 + Math.max(...layers.map(l =>
+    (layerMap.get(l).length) * Math.max(20, Math.min(60, (H - margin.top*2) / layerMap.get(l).length))
+  )));
+
+  // Zoom
+  const zoom = d3.zoom()
+    .scaleExtent([0.05, 4])
+    .on("zoom", e => root.attr("transform", e.transform));
+  svg.call(zoom);
+
+  // Layer labels
+  layers.forEach((layer, li) => {
+    root.append("text")
+      .attr("class", "layer-label")
+      .attr("x", margin.left + li * colW)
+      .attr("y", 20)
+      .attr("text-anchor", "middle")
+      .text(`L${layer}`);
+  });
+
+  // Edges
+  const linkSel = root.append("g").attr("class", "links")
+    .selectAll("path")
+    .data(data.edges)
+    .join("path")
+    .attr("class", "link")
+    .attr("d", d => {
+      const s = nodePos[d.source];
+      const t = nodePos[d.target];
+      if (!s || !t) return "";
+      const mx = (s.x + t.x) / 2;
+      return `M${s.x},${s.y} C${mx},${s.y} ${mx},${t.y} ${t.x},${t.y}`;
+    })
+    .attr("marker-end", "url(#arrow)");
+
+  // Nodes
+  const nodeSel = root.append("g").attr("class", "nodes")
+    .selectAll("g")
+    .data(data.nodes)
+    .join("g")
+    .attr("class", "node")
+    .attr("transform", d => {
+      const p = nodePos[d.id];
+      return p ? `translate(${p.x},${p.y})` : "translate(0,0)";
+    })
+    .on("click", (event, d) => {
+      event.stopPropagation();
+      selectNode(d, nodeSel, linkSel, nodePos);
+    });
+
+  nodeSel.append("circle")
+    .attr("r", 7)
+    .attr("fill", d => nodeColor(d.winner))
+    .attr("stroke", d => d3.color(nodeColor(d.winner)).darker(0.5));
+
+  // Fit view initially
+  const bbox = { x: 0, y: 0, width: totalW, height: totalH };
+  const scale = Math.min(W / totalW, H / totalH) * 0.9;
+  svg.call(zoom.transform, d3.zoomIdentity
+    .translate(W/2 - totalW*scale/2, H/2 - totalH*scale/2)
+    .scale(scale));
+}
+
+function selectNode(d, nodeSel, linkSel, nodePos) {
+  selectedNode = d;
+
+  // Highlight selected
+  nodeSel.classed("selected", n => n.id === d.id);
+
+  // Highlight connected edges
+  linkSel.classed("highlighted", e => e.source === d.id || e.target === d.id);
+
+  // Show in sidebar
+  showNodeInfo(d);
+}
+
+async function showNodeInfo(d) {
+  const res = await fetch(`${API}/api/node?canonical=${encodeURIComponent(d.canonical)}&turn=${d.turn}`);
+  const info = await res.json();
+
+  const container = document.getElementById("node-info");
+  const wLabel = winnerLabel(info.winner);
+  const wColor = winnerBg(info.winner);
+
+  container.innerHTML = `
+    <div class="info-row"><span class="info-label">Canonical</span><span class="info-val" style="word-break:break-all;max-width:160px">${info.canonical}</span></div>
+    <div class="info-row"><span class="info-label">Player</span><span class="info-val">P${info.turn + 1}</span></div>
+    <div class="info-row"><span class="info-label">Layer</span><span class="info-val">${info.layer}</span></div>
+    <div class="winner-badge" style="background:${wColor}20;color:${wColor};border:1px solid ${wColor}40">
+      winner ${wLabel}
+    </div>
+
+    <div class="section-title">Children (${info.children.length})</div>
+    ${info.children.map(c => `
+      <div class="child-item" onclick="fetchAndHighlight('${c.canonical}', ${c.turn})">
+        ${c.canonical} P${c.turn+1}
+      </div>
+    `).join("")}
+
+    <div class="section-title">Parents (${info.parents.length})</div>
+    ${info.parents.map(p => `
+      <div class="child-item" onclick="fetchAndHighlight('${p.canonical}', ${p.turn})">
+        ${p.canonical} P${p.turn+1}
+      </div>
+    `).join("")}
+  `;
+}
+
+async function fetchAndHighlight(canonical, turn) {
+  const res = await fetch(`${API}/api/node?canonical=${encodeURIComponent(canonical)}&turn=${turn}`);
+  const info = await res.json();
+  showNodeInfo(info);
+}
+
+document.getElementById("load-btn").addEventListener("click", loadTree);
+document.getElementById("max-layer").addEventListener("keydown", e => { if (e.key === "Enter") loadTree(); });
+
+// Init: fetch layer range from server
+fetch(`${API}/api/tree?min_layer=0&max_layer=0`).then(r => r.json()).then(d => {
+  document.getElementById("max-layer").max = d.max_layer;
+  document.getElementById("min-layer").max = d.max_layer;
+  document.getElementById("status").textContent =
+    `DB loaded: layers ${d.min_layer}–${d.max_layer}`;
+}).catch(() => {
+  document.getElementById("status").textContent = "Start the server first";
+});
+</script>
+</body>
+</html>

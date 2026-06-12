@@ -97,7 +97,7 @@ class GameState:
         return next_states_list
 
     def is_terminal(self) -> bool:
-        return all(not gap.legal_moves() for gap in self.gaps)
+        return len(self.gaps) == 0
 
     def __repr__(self) -> str:
         gaps_str = ', '.join(str(g) for g in self.gaps)
@@ -467,6 +467,118 @@ def migrate_db(n: int):
     print(f"Done. New DB: {new_db}")
 
 
+def build_game_tree_v2(n: int, chunk_size: int = 50000):
+    import time
+    from collections import defaultdict
+
+    db_name = os.path.join(os.getcwd(), f"gamestates_n{n}_v2.db")
+    conn = sqlite3.connect(db_name)
+    cur = conn.cursor()
+
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA cache_size=-64000")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS gamestates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical TEXT NOT NULL,
+            turn INTEGER NOT NULL,
+            layer INTEGER,
+            winner TEXT,
+            UNIQUE(canonical, turn)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS edges (
+            parent_canonical TEXT NOT NULL,
+            parent_turn INTEGER NOT NULL,
+            child_canonical TEXT NOT NULL,
+            child_turn INTEGER NOT NULL,
+            PRIMARY KEY (parent_canonical, parent_turn, child_canonical, child_turn)
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_edges_parent ON edges (parent_canonical, parent_turn)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_edges_child ON edges (child_canonical, child_turn)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_gamestates_layer ON gamestates (layer)")
+    conn.commit()
+
+    total_start = time.time()
+
+    # Step 1: generate all signed partitions of n, collapsed
+    print(f"Generating signed partitions of {n}...", flush=True)
+    seen = set()
+    layers = defaultdict(list)
+
+    for state in signed_partitions_gen(n):
+        key = (canonical_str(state), state.turn)
+        if key not in seen:
+            seen.add(key)
+            layers[layer_of(state)].append(state)
+
+    total_initial = sum(len(v) for v in layers.values())
+    print(f"  {total_initial:,} unique initial states across layers {min(layers)}-{max(layers)}", flush=True)
+
+    # Step 2: process layers from highest to lowest
+    max_layer = max(layers.keys())
+
+    for layer_num in range(max_layer, -1, -1):
+        current_layer = layers.get(layer_num, [])
+        if not current_layer:
+            continue
+
+        layer_start = time.time()
+        print(f"Layer {layer_num}: {len(current_layer)} states", end="", flush=True)
+
+        state_rows = []
+        edge_rows = []
+
+        for state in current_layer:
+            canonical = canonical_str(state)
+            state_rows.append((canonical, state.turn, layer_num))
+
+            for child in state.legal_moves():
+                child_canonical = canonical_str(child)
+                edge_rows.append((canonical, state.turn, child_canonical, child.turn))
+                child_key = (child_canonical, child.turn)
+                if child_key not in seen:
+                    seen.add(child_key)
+                    layers[layer_of(child)].append(child)
+
+            # Flush in chunks
+            if len(state_rows) >= chunk_size:
+                cur.executemany(
+                    "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
+                    state_rows
+                )
+                cur.executemany(
+                    "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
+                    edge_rows
+                )
+                conn.commit()
+                state_rows = []
+                edge_rows = []
+
+        # Final flush for this layer
+        if state_rows:
+            cur.executemany(
+                "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
+                state_rows
+            )
+        if edge_rows:
+            cur.executemany(
+                "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
+                edge_rows
+            )
+        conn.commit()
+
+        layer_time = time.time() - layer_start
+        total_time = time.time() - total_start
+        print(f" | layer: {layer_time:.2f}s | total: {total_time:.2f}s", flush=True)
+
+    print(f"Done. {time.time() - total_start:.2f}s total.")
+    conn.close()
+
 # ------------------------------------------------------------------------------
 # (OLD) BFS LAYER-BY-LAYER WITH PAUSE/RESUME - creating game tree from single node
 # ------------------------------------------------------------------------------
@@ -532,7 +644,7 @@ def bfs_store_sql_resume(root_state: GameState, cur, conn):
 # --------------------------
 # DETERMINING WINNER FROM LAST LAYER
 # --------------------------
-def compute_misere_winners(n: int):
+def compute_misere_winners_old(n: int):
     """
     Computes 3-player misère winners [curr, next, prev] for all GameStates
     in gamestates_n{n}.db and updates the 'winner' column.
@@ -601,7 +713,68 @@ def compute_misere_winners(n: int):
     print("Finished computing misère winners.")
     conn.close()
 
+def compute_misere_winners(n: int, version: str = "v2"):
+    db_name = f"gamestates_n{n}_{version}.db"
+    conn = sqlite3.connect(db_name)
+    cur = conn.cursor()
 
+    cur.execute("SELECT MAX(layer) FROM gamestates")
+    max_layer = cur.fetchone()[0]
+
+    print(f"Computing misère winners from layer 0 → {max_layer}...")
+
+    for layer in range(max_layer + 1):
+        cur.execute("SELECT canonical, turn FROM gamestates WHERE layer=?", (layer,))
+        rows = cur.fetchall()
+        print(f"Processing layer {layer}, {len(rows)} states", flush=True)
+
+        for canonical, turn in rows:
+            gaps, inevitable_moves = parse_gaps(canonical)
+            state = GameState(gaps, turn, inevitable_moves)
+
+            if state.is_terminal():
+                m = state.inevitable_moves
+                if m == 0:
+                    winner = [1, 1, 0]
+                elif m == 1:
+                    winner = [0, 1, 1]
+                else:  # m == 2
+                    winner = [1, 0, 1]
+            else:
+                # Fetch all children via edges table — may be at any lower layer
+                cur.execute(
+                    """SELECT child_canonical, child_turn FROM edges
+                       WHERE parent_canonical=? AND parent_turn=?""",
+                    (canonical, turn)
+                )
+                child_rows = cur.fetchall()
+
+                child_statuses = []
+                for child_canonical, child_turn in child_rows:
+                    cur.execute(
+                        "SELECT winner FROM gamestates WHERE canonical=? AND turn=?",
+                        (child_canonical, child_turn)
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        child_statuses.append(json.loads(row[0]))
+                    else:
+                        child_statuses.append([0, 0, 0])
+
+                prev_val = int(all(c[1] for c in child_statuses))
+                curr_val = int(any(c[2] for c in child_statuses))
+                next_val = int(all(c[0] for c in child_statuses))
+                winner = [curr_val, next_val, prev_val]
+
+            cur.execute(
+                "UPDATE gamestates SET winner=? WHERE canonical=? AND turn=?",
+                (json.dumps(winner), canonical, turn)
+            )
+
+        conn.commit()
+
+    print("Finished computing misère winners.")
+    conn.close()
 
 def Get_Gamegraph_and_Strategy(n):
     conn, cur = get_db_connection(n)
@@ -796,11 +969,45 @@ def longest_gap_in_missing(n: int, layer: int):
     print(f"In state: {max_state}")
     return max_size, max_state
 
+# ------------------------------------------------------------------------------
+# Exploring db
+# ------------------------------------------------------------------------------
+
+def inspect_layer(n: int, layer: int, version: str = "v2"):
+    conn = sqlite3.connect(f"gamestates_n{n}_{version}.db")
+    cur = conn.cursor()
+    cur.execute("SELECT canonical, turn FROM gamestates WHERE layer=?", (layer,))
+    for row in cur.fetchall():
+        print(row)
+    conn.close()
+
+def find_multi_turn_states(n: int, version: str = "v2"):
+    conn = sqlite3.connect(f"gamestates_n{n}_{version}.db")
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT canonical, COUNT(DISTINCT turn) as turn_count, GROUP_CONCAT(turn) as turns
+        FROM gamestates
+        GROUP BY canonical
+        HAVING COUNT(DISTINCT turn) > 1
+        ORDER BY turn_count DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+
+    print(f"Found {len(rows)} canonical forms reachable with multiple turns:")
+    for canonical, turn_count, turns in rows[:40]:  # show first 40
+        print(f"  {canonical}  turns={turns}")
+    return rows
 
 # --------------------------
 # MAIN
 # --------------------------
 if __name__ == "__main__":
+
+    for l in range(5):
+        print(f"\nLayer {l}:")
+        inspect_layer(26, l)
     """
     import time
     import tracemalloc
