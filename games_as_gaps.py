@@ -981,6 +981,16 @@ def inspect_layer(n: int, layer: int, version: str = "v2"):
         print(row)
     conn.close()
 
+def find_state(n: int, version: str, canonical: str):
+    conn = sqlite3.connect(f"gamestates_n{n}_{version}.db")
+    cur = conn.cursor()
+    cur.execute("SELECT canonical, turn, layer, winner FROM gamestates WHERE canonical LIKE ?",
+                (f"{canonical}%",))
+    rows = cur.fetchall()
+    conn.close()
+    for row in rows:
+        print(row)
+
 def find_multi_turn_states(n: int, version: str = "v2"):
     conn = sqlite3.connect(f"gamestates_n{n}_{version}.db")
     cur = conn.cursor()

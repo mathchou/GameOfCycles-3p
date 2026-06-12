@@ -230,6 +230,14 @@
   </div>
   <button id="load-btn">Load</button>
   <div id="status">Ready</div>
+  <div class="ctrl-group">
+    <label>Search</label>
+    <input type="text" id="search-input" placeholder="+26|0"
+           style="width:120px;background:#252836;border:1px solid #3a3f5c;
+                  color:#e2e8f0;padding:4px 6px;border-radius:4px;
+                  font-family:inherit;font-size:12px;">
+    <button id="search-btn">Find</button>
+  </div>
   <div id="legend">
     <div class="legend-item"><div class="legend-dot" style="background:#4ade80"></div>curr wins</div>
     <div class="legend-item"><div class="legend-dot" style="background:#60a5fa"></div>next wins</div>
@@ -449,10 +457,88 @@ async function showNodeInfo(d) {
 }
 
 async function fetchAndHighlight(canonical, turn) {
-  const res = await fetch(`${API}/api/node?canonical=${encodeURIComponent(canonical)}&turn=${turn}`);
-  const info = await res.json();
-  showNodeInfo(info);
+    const res = await fetch(`${API}/api/node?canonical=${encodeURIComponent(canonical)}&turn=${turn}`);
+    const info = await res.json();
+    showNodeInfo(info);
+
+    // Find node in current graph and highlight it
+    if (!currentData) return;
+    const node = currentData.nodes.find(n => n.canonical === canonical && n.turn === turn);
+    if (!node) {
+        document.getElementById("status").textContent = `Node not in current view — load layer ${info.layer} to see it`;
+        return;
+    }
+
+    // Get current selections
+    const nodeSel = d3.select("#root").select(".nodes").selectAll("g");
+    const linkSel = d3.select("#root").select(".links").selectAll("path");
+
+    // Reuse nodePos from current render — rebuild it
+    const layerMap = d3.group(currentData.nodes, d => d.layer);
+    const layers = Array.from(layerMap.keys()).sort((a,b) => a - b);
+    const W = document.getElementById("graph-container").offsetWidth;
+    const H = document.getElementById("graph-container").offsetHeight;
+    const colW = Math.max(180, W / (layers.length + 1));
+    const margin = { top: 40, left: 60 };
+    const nodePos = {};
+    layers.forEach((layer, li) => {
+        const nodesInLayer = layerMap.get(layer);
+        const rowH = Math.max(20, Math.min(60, (H - margin.top * 2) / nodesInLayer.length));
+        nodesInLayer.forEach((n, ni) => {
+            nodePos[n.id] = {
+                x: margin.left + li * colW,
+                y: margin.top + ni * rowH + rowH / 2
+            };
+        });
+    });
+
+    selectNode(node, nodeSel, linkSel, nodePos);
+
+    // Pan to the node
+    const pos = nodePos[node.id];
+    if (pos) {
+        const svg = d3.select("#svg");
+        const zoom = d3.zoom().scaleExtent([0.05, 4]).on("zoom", e =>
+            d3.select("#root").attr("transform", e.transform));
+        svg.call(zoom);
+        const W2 = document.getElementById("graph-container").offsetWidth;
+        const H2 = document.getElementById("graph-container").offsetHeight;
+        svg.transition().duration(500).call(
+            zoom.transform,
+            d3.zoomIdentity.translate(W2/2 - pos.x, H2/2 - pos.y)
+        );
+    }
 }
+
+async function searchNodes() {
+    const q = document.getElementById("search-input").value.trim();
+    if (!q) return;
+    const res = await fetch(`${API}/api/search?q=${encodeURIComponent(q)}`);
+    const results = await res.json();
+
+    const container = document.getElementById("node-info");
+    if (results.length === 0) {
+        container.innerHTML = `<div style="color:#8891a8;font-size:12px">No results for "${q}"</div>`;
+        return;
+    }
+
+    container.innerHTML = `
+        <div style="color:#7c85f5;font-size:11px;margin-bottom:8px">
+            ${results.length} result(s) for "${q}"
+        </div>
+        ${results.map(r => `
+            <div class="child-item" onclick="fetchAndHighlight('${r.canonical}', ${r.turn})">
+                ${r.canonical} P${r.turn+1} L${r.layer} ${winnerLabel(r.winner)}
+            </div>
+        `).join("")}
+    `;
+}
+
+document.getElementById("search-btn").addEventListener("click", searchNodes);
+document.getElementById("search-input").addEventListener("keydown",
+    e => { if (e.key === "Enter") searchNodes(); });
+
+
 
 document.getElementById("load-btn").addEventListener("click", loadTree);
 document.getElementById("max-layer").addEventListener("keydown", e => { if (e.key === "Enter") loadTree(); });
@@ -466,6 +552,7 @@ fetch(`${API}/api/tree?min_layer=0&max_layer=0`).then(r => r.json()).then(d => {
 }).catch(() => {
   document.getElementById("status").textContent = "Start the server first";
 });
+
 </script>
 </body>
 </html>

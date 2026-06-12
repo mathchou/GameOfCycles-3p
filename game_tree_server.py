@@ -134,6 +134,29 @@ class Handler(BaseHTTPRequestHandler):
                 })
             else:
                 self.send_json({"error": "not found"})
+
+        elif parsed.path == "/api/search":
+            params = parse_qs(parsed.query)
+            query = params.get("q", [""])[0]
+            db_path = get_db_path(self.n, self.version)
+            conn = sqlite3.connect(db_path)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT canonical, turn, layer, winner 
+                FROM gamestates 
+                WHERE canonical LIKE ?
+                ORDER BY layer, canonical, turn
+                LIMIT 50
+            """, (f"%{query}%",))
+            rows = cur.fetchall()
+            conn.close()
+            self.send_json([{
+                "canonical": r[0],
+                "turn": r[1],
+                "layer": r[2],
+                "winner": json.loads(r[3]) if r[3] else None
+            } for r in rows])
+
         else:
             self.send_response(404)
             self.end_headers()
