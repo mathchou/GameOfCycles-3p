@@ -18,6 +18,9 @@ class Gap:
     def is_dead(self) -> bool:
         return self.orientation == -1 and self.size == 1
 
+    def layer_of(state: GameState) -> int:
+        return sum(g.size for g in state.gaps) + state.inevitable_moves
+
     def legal_moves(self) -> List[Tuple["Gap", ...]]:
         moves = []
         if self.size <= 0 or self.is_dead():
@@ -50,14 +53,35 @@ class Gap:
 # --------------------------
 # GAMESTATE CLASS
 # --------------------------
+INEVITABLE_MOVES = {
+    (1, 1): 1,  # +1: 1 move
+    (2, 1): 2,  # +2: 2 moves
+    (2, -1): 1,  # -2: 1 move
+    (3, -1): 2,  # -3: 2 moves
+    (4, -1): 3,  # -4: 3 moves
+}
+
+
 class GameState:
-    def __init__(self, gaps: List[Gap], turn: int = 0):
+    def __init__(self, gaps: List[Gap], turn: int = 0, inevitable_moves: int = 0):
         gaps_list = [g if isinstance(g, Gap) else Gap(*g) for g in gaps]
-        # Sort by size descending, then orientation descending (+1 before -1)
-        self.gaps = sorted(gaps_list, key=lambda g: (-g.size, -g.orientation))
+
+        # Separate inevitable and live gaps
+        live_gaps = []
+        total_inevitable = inevitable_moves
+        for g in gaps_list:
+            if g.is_dead():
+                pass  # silently drop -1 gaps
+            elif (g.size, g.orientation) in INEVITABLE_MOVES:
+                total_inevitable += INEVITABLE_MOVES[(g.size, g.orientation)]
+            else:
+                live_gaps.append(g)
+
+        self.gaps = sorted(live_gaps, key=lambda g: (-g.size, -g.orientation))
+        self.inevitable_moves = total_inevitable % 3
         self.turn = turn % 3
 
-    def canonical(self) -> Tuple[Tuple[int,int], ...]:
+    def canonical(self) -> Tuple[Tuple[int, int], ...]:
         return tuple((g.size, g.orientation) for g in self.gaps)
 
     def legal_moves(self) -> List["GameState"]:
@@ -66,8 +90,8 @@ class GameState:
 
         for i, gap in enumerate(self.gaps):
             for move in gap.legal_moves():
-                new_gaps = self.gaps[:i] + list(move) + self.gaps[i+1:]
-                new_state = GameState(new_gaps, self.turn + 1)
+                new_gaps = self.gaps[:i] + list(move) + self.gaps[i + 1:]
+                new_state = GameState(new_gaps, self.turn + 1, self.inevitable_moves)
                 key = (new_state.canonical(), new_state.turn)
                 if key not in next_states_set:
                     next_states_set.add(key)
@@ -80,16 +104,39 @@ class GameState:
 
     def __repr__(self) -> str:
         gaps_str = ', '.join(str(g) for g in self.gaps)
-        return f"[{gaps_str}] (Player {self.turn + 1}'s turn)"
+        return f"[{gaps_str}] inevitable={self.inevitable_moves} (Player {self.turn + 1}'s turn)"
 
 
 # --------------------------
 # CANONICAL STRING FOR SQL
 # --------------------------
 def canonical_str(state: GameState) -> str:
-    if not state.gaps:
-        return ''  # empty state
-    return ",".join(f"{'+' if g.orientation == 1 else '-'}{g.size}" for g in state.gaps)
+    gaps_part = ",".join(f"{'+' if g.orientation == 1 else '-'}{g.size}" for g in state.gaps)
+    return f"{gaps_part}|{state.inevitable_moves}"
+
+def parse_gaps(canonical: str) -> Tuple[List[Gap], int]:
+    """
+    converting canonical_str back into gamestate
+    """
+    if '|' in canonical:
+        gaps_part, inevitable_part = canonical.rsplit('|', 1)
+        inevitable_moves = int(inevitable_part)
+    else:
+        gaps_part = canonical
+        inevitable_moves = 0  # backwards compatibility with old DBs
+
+    if not gaps_part:
+        return [], inevitable_moves
+
+    gaps = []
+    for g in gaps_part.split(','):
+        if not g:
+            continue
+        orientation = 1 if g[0] == '+' else -1
+        size = int(g[1:])
+        gaps.append(Gap(size, orientation))
+
+    return gaps, inevitable_moves
 
 # ----------------------------------------------------
 # Generating all game-states at a particular layer
@@ -144,17 +191,7 @@ def signed_partitions_gen(n):
 # --------------------------
 # DATABASE SETUP
 # --------------------------
-def parse_gaps(canonical: str) -> List[Gap]:
-    if not canonical:
-        return []
-    gaps = []
-    for g in canonical.split(','):
-        if not g:
-            continue
-        orientation = 1 if g[0] == '+' else -1
-        size = int(g[1:])
-        gaps.append(Gap(size, orientation))
-    return gaps
+
 
 def get_db_connection(n: int):
     db_name = os.path.join(os.getcwd(), f"gamestates_n{n}.db")
@@ -236,120 +273,75 @@ def build_game_tree(n: int, chunk_size: int = 50000):
     import time
     conn, cur = get_db_connection(n)
     total_start = time.time()
-    layer_num = 0
 
-    # Layer 0: stream from generator, flush to DB in chunks
-    print(f"Layer 0: streaming signed partitions...")
-    layer_start = time.time()
-    state_rows = []
-    edge_rows = []
-    total_states = 0
-
+    # Layer 0 is now variable — group initial states by their layer
+    print(f"Generating initial states...", flush=True)
+    from collections import defaultdict
+    layers = defaultdict(list)
     for state in signed_partitions_gen(n):
-        canonical = canonical_str(state)
-        state_rows.append((canonical, state.turn, layer_num))
-        for child in state.legal_moves():
-            child_canonical = canonical_str(child)
-            edge_rows.append((canonical, state.turn, child_canonical, child.turn))
-        total_states += 1
+        layers[layer_of(state)].append(state)
 
-        if len(state_rows) >= chunk_size:
-            cur.executemany(
-                "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
-                state_rows
-            )
-            cur.executemany(
-                "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
-                edge_rows
-            )
-            conn.commit()
-            state_rows = []
-            edge_rows = []
-            print(f"  flushed {total_states} states...", flush=True)
+    # Process layers from highest to lowest
+    max_layer = max(layers.keys())
+    print(f"Max layer: {max_layer}", flush=True)
 
-    # Flush remainder
-    if state_rows:
-        cur.executemany(
-            "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
-            state_rows
-        )
-        cur.executemany(
-            "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
-            edge_rows
-        )
-        conn.commit()
-
-    layer_time = time.time() - layer_start
-    print(f"Layer 0: {total_states} states | {layer_time:.2f}s")
-
-    # Remaining layers: read from DB, expand, write children to DB
-    layer_num = 1
-    while True:
-        # Read all states from previous layer
-        cur.execute(
-            "SELECT canonical, turn FROM gamestates WHERE layer=?",
-            (layer_num - 1,)
-        )
-        prev_rows = cur.fetchall()
-        if not prev_rows:
-            break
-
-        # Expand children via edges table — no need to recompute legal_moves
-        cur.execute(
-            """SELECT DISTINCT e.child_canonical, e.child_turn
-               FROM edges e
-               JOIN gamestates g ON g.canonical = e.parent_canonical AND g.turn = e.parent_turn
-               WHERE g.layer = ?""",
-            (layer_num - 1,)
-        )
-        child_rows = cur.fetchall()
-
-        if not child_rows:
-            break
+    seen = set()
+    for layer_num in range(max_layer, -1, -1):
+        current_layer = layers[layer_num]
+        if not current_layer:
+            continue
 
         layer_start = time.time()
-        print(f"Layer {layer_num}: {len(child_rows)} states", end="", flush=True)
+        print(f"Layer {layer_num}: {len(current_layer)} states", end="", flush=True)
 
-        # Insert children as new layer, their edges already exist from parent expansion
-        cur.executemany(
-            "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
-            [(c, t, layer_num) for c, t in child_rows]
-        )
-        conn.commit()
-
-        # Now expand children's edges
         state_rows = []
         edge_rows = []
-        for child_canonical, child_turn in child_rows:
-            gaps = parse_gaps(child_canonical)
-            state = GameState(gaps, child_turn)
-            for grandchild in state.legal_moves():
-                gc_canonical = canonical_str(grandchild)
-                edge_rows.append((child_canonical, child_turn, gc_canonical, grandchild.turn))
-            state_rows.append((child_canonical, child_turn, layer_num))
+
+        for state in current_layer:
+            canonical = canonical_str(state)
+            key = (canonical, state.turn)
+            if key in seen:
+                continue
+            seen.add(key)
+            state_rows.append((canonical, state.turn, layer_num))
+
+            for child in state.legal_moves():
+                child_canonical = canonical_str(child)
+                edge_rows.append((canonical, state.turn, child_canonical, child.turn))
+                child_key = (child_canonical, child.turn)
+                if child_key not in seen:
+                    layers[layer_of(child)].append(child)
 
             if len(edge_rows) >= chunk_size * 10:
+                cur.executemany(
+                    "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
+                    state_rows
+                )
                 cur.executemany(
                     "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
                     edge_rows
                 )
                 conn.commit()
+                state_rows = []
                 edge_rows = []
 
+        if state_rows:
+            cur.executemany(
+                "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
+                state_rows
+            )
         if edge_rows:
             cur.executemany(
                 "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
                 edge_rows
             )
-            conn.commit()
+        conn.commit()
 
         layer_time = time.time() - layer_start
         total_time = time.time() - total_start
         print(f" | layer: {layer_time:.2f}s | total: {total_time:.2f}s")
 
-        layer_num += 1
-
-    print(f"Done. {layer_num} layers total in {time.time() - total_start:.2f}s.")
+    print(f"Done. {time.time() - total_start:.2f}s total.")
     conn.close()
 
 # ------------------------------------------------------------------------------
@@ -578,44 +570,106 @@ def filter_nodes_with_target_child(n: int, layer: int, target_winner: list = [0,
 
 def check_grandchildren_winners_sql(n: int, layer: int):
     conn, cur = get_db_connection(n)
-
     grandchild_layer = layer + 2
 
+    print("Step 1: finding green grandchildren...", flush=True)
+    cur.execute("DROP TABLE IF EXISTS temp_green_2")
     cur.execute("""
-        SELECT canonical, turn
-        FROM gamestates
-        WHERE layer = ?
-        AND (canonical, turn) NOT IN (
-            SELECT DISTINCT e.parent_canonical, e.parent_turn
-            FROM edges e
-            WHERE (e.child_canonical, e.child_turn) IN (
-                SELECT DISTINCT e2.parent_canonical, e2.parent_turn
-                FROM edges e2
-                WHERE (e2.child_canonical, e2.child_turn) IN (
-                    SELECT canonical, turn
-                    FROM gamestates
-                    WHERE layer = ?
-                    AND json_extract(winner, '$[0]') = 0
-                )
-            )
-        )
-    """, (layer, grandchild_layer))
+        CREATE TEMPORARY TABLE temp_green_2 AS
+        SELECT canonical, turn FROM gamestates
+        WHERE layer = ? AND json_extract(winner, '$[0]') = 0
+    """, (grandchild_layer,))
+    cur.execute("SELECT COUNT(*) FROM temp_green_2")
+    print(f"  {cur.fetchone()[0]:,} green grandchildren", flush=True)
 
+    print("Step 2: finding green middle...", flush=True)
+    cur.execute("DROP TABLE IF EXISTS temp_green_1")
+    cur.execute("""
+        CREATE TEMPORARY TABLE temp_green_1 AS
+        SELECT DISTINCT e.parent_canonical, e.parent_turn
+        FROM edges e
+        JOIN temp_green_2 g ON g.canonical = e.child_canonical AND g.turn = e.child_turn
+    """)
+    cur.execute("SELECT COUNT(*) FROM temp_green_1")
+    print(f"  {cur.fetchone()[0]:,} green middle states", flush=True)
+
+    print("Step 3: finding green top...", flush=True)
+    cur.execute("DROP TABLE IF EXISTS temp_green_0")
+    cur.execute("""
+        CREATE TEMPORARY TABLE temp_green_0 AS
+        SELECT DISTINCT e.parent_canonical, e.parent_turn
+        FROM edges e
+        JOIN gamestates g ON g.canonical = e.parent_canonical AND g.turn = e.parent_turn
+        JOIN temp_green_1 g1 ON g1.parent_canonical = e.child_canonical AND g1.parent_turn = e.child_turn
+        WHERE g.layer = ?
+    """, (layer,))
+    cur.execute("SELECT COUNT(*) FROM temp_green_0")
+    print(f"  {cur.fetchone()[0]:,} green top states", flush=True)
+
+    print("Step 4: finding missing...", flush=True)
+    cur.execute("""
+        SELECT g.canonical, g.turn, g.winner FROM gamestates g
+        LEFT JOIN temp_green_0 t ON t.parent_canonical = g.canonical AND t.parent_turn = g.turn
+        WHERE g.layer = ? AND t.parent_canonical IS NULL
+    """, (layer,))
     missing = cur.fetchall()
 
     cur.execute("SELECT COUNT(*) FROM gamestates WHERE layer=?", (layer,))
     total = cur.fetchone()[0]
 
+    # cleanup
+    cur.execute("DROP TABLE IF EXISTS temp_green_2")
+    cur.execute("DROP TABLE IF EXISTS temp_green_1")
+    cur.execute("DROP TABLE IF EXISTS temp_green_0")
+    conn.commit()
     conn.close()
 
-    print(f"Layer {layer}: {total - len(missing)}/{total} states have a grandchild with winner[0]==0")
-    if missing:
-        print(f"  {len(missing)} states do NOT:")
-        #for canonical, turn in missing:
-        #    print(f"    {canonical} turn={turn}")
+    print(f"Layer {layer}: {total - len(missing):,}/{total:,} states have a grandchild with winner[0]==0")
+    print(f"  {len(missing):,} states do NOT", flush=True)
+
+    # Write missing states to a new SQLite DB
+    out_db = f"missing_grandchildren_n{n}_layer{layer}.db"
+    out_conn = sqlite3.connect(out_db)
+    out_cur = out_conn.cursor()
+    out_cur.execute("""
+        CREATE TABLE IF NOT EXISTS missing_states (
+            canonical TEXT NOT NULL,
+            turn INTEGER NOT NULL,
+            winner TEXT,
+            PRIMARY KEY (canonical, turn)
+        )
+    """)
+    out_cur.executemany(
+        "INSERT OR IGNORE INTO missing_states (canonical, turn, winner) VALUES (?, ?, ?)",
+        missing
+    )
+    out_conn.commit()
+    out_conn.close()
+    print(f"  saved to {out_db}")
+
     return missing
 
+def longest_gap_in_missing(n: int, layer: int):
+    out_db = f"missing_grandchildren_n{n}_layer{layer}.db"
+    conn = sqlite3.connect(out_db)
+    cur = conn.cursor()
 
+    cur.execute("SELECT canonical FROM missing_states")
+    rows = cur.fetchall()
+    conn.close()
+
+    max_size = 0
+    max_state = None
+
+    for (canonical,) in rows:
+        first_gap = parse_gaps(canonical)[0]
+        if first_gap.size > max_size:
+            max_size = first_gap.size
+            max_state = canonical
+
+    print(f"Longest gap size: {max_size}")
+    print(f"In state: {max_state}")
+    return max_size, max_state
 
 
 # --------------------------
