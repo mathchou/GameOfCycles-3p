@@ -1,28 +1,16 @@
 from games_as_gaps import *
 import tkinter as tk
 import sqlite3
+import json
 import pandas as pd
-
-def parse_gaps(canonical: str):
-    if not canonical:
-        return []
-    gaps = []
-    for g in canonical.split(','):
-        if not g:
-            continue
-        orientation = 1 if g[0] == '+' else -1
-        size = int(g[1:])
-        gaps.append(Gap(size, orientation))
-    return gaps
-
 
 
 class CLI_GameExplorer:
     def __init__(self, n):
-        self.db = f"gamestates_n{n}.db"
+        self.db = f"gamestates_n{n}_reduced.db"
         self.conn = sqlite3.connect(self.db)
         self.cur = self.conn.cursor()
-        self.history = []  # for navigating backward
+        self.history = []
 
     def load_state(self, canonical, turn):
         self.cur.execute(
@@ -37,25 +25,25 @@ class CLI_GameExplorer:
         return {"canonical": canonical, "turn": turn, "winner": winner, "layer": layer}
 
     def get_children(self, canonical, turn):
-        gaps = parse_gaps(canonical)
-        state = GameState(gaps, turn)
+        self.cur.execute(
+            "SELECT child_canonical, child_turn FROM edges WHERE parent_canonical=? AND parent_turn=?",
+            (canonical, turn)
+        )
+        child_rows = self.cur.fetchall()
         children = []
-
-        for child in state.legal_moves():
-            child_key = (canonical_str(child), child.turn)
+        for child_canonical, child_turn in child_rows:
             self.cur.execute(
                 "SELECT winner, layer FROM gamestates WHERE canonical=? AND turn=?",
-                child_key
+                (child_canonical, child_turn)
             )
             row = self.cur.fetchone()
             if row:
                 children.append({
-                    "canonical": child_key[0],
-                    "turn": child_key[1],
+                    "canonical": child_canonical,
+                    "turn": child_turn,
                     "winner": row[0],
                     "layer": row[1]
                 })
-
         return children
 
     def explore(self, start_canonical, start_turn=0):
@@ -102,34 +90,28 @@ BLOCK_SIZE = 25
 BLOCK_HEIGHT = 40
 BLOCK_SPACING = 5
 
+
 class VisualGameExplorer:
     def __init__(self, n):
         self.root = tk.Tk()
-        self.root.title(f"Game Explorer n={n}")   # CREATE ROOT FIRST
+        self.root.title(f"Game Explorer n={n}")
         self.root.geometry("1200x1800")
         self.root.state("zoomed")
         self.highlight_enabled = tk.BooleanVar(self.root, value=True)
         self.n = n
 
-        self.db = f"gamestates_n{n}.db"
+        self.db = f"gamestates_n{n}_reduced.db"
         self.conn = sqlite3.connect(self.db)
         self.cur = self.conn.cursor()
 
         self.history = []
 
-        # Canvas for drawing gaps
         self.canvas = tk.Canvas(
             self.root,
-            height=BLOCK_HEIGHT + 20,  # fixed height
+            height=BLOCK_HEIGHT + 20,
             bg="white"
         )
-
-        self.canvas.pack(
-            fill="x",  # expand horizontally only
-            expand=False,  # do NOT expand vertically
-            pady=10,
-            anchor="n"  # keep it at the top
-        )
+        self.canvas.pack(fill="x", expand=False, pady=10, anchor="n")
 
         self.state_label = tk.Label(self.root, font=("Arial", 12))
         self.state_label.pack()
@@ -137,7 +119,6 @@ class VisualGameExplorer:
         self.info_label = tk.Label(self.root, font=("Arial", 11))
         self.info_label.pack()
 
-        # Highlight toggle
         self.toggle = tk.Checkbutton(
             self.root,
             text="Highlight Winning Moves",
@@ -152,9 +133,6 @@ class VisualGameExplorer:
         self.back_button = tk.Button(self.root, text="Back", command=self.go_back)
         self.back_button.pack(pady=5)
 
-    # -----------------------------
-    # Drawing gaps visually
-    # -----------------------------
     def draw_gaps(self, canonical):
         self.canvas.delete("all")
         x = 10
@@ -163,14 +141,20 @@ class VisualGameExplorer:
             self.canvas.create_text(150, 30, text="Terminal State", font=("Arial", 12))
             return
 
-        for g in canonical.split(','):
+        # Split off inevitable moves
+        if '|' in canonical:
+            gaps_part, inevitable_part = canonical.rsplit('|', 1)
+            inevitable_moves = int(inevitable_part)
+        else:
+            gaps_part = canonical
+            inevitable_moves = 0
+
+        for g in gaps_part.split(','):
             if not g:
                 continue
-
             orientation = 1 if g[0] == '+' else -1
             size = int(g[1:])
             color = "steelblue" if orientation == 1 else "indianred"
-
             for _ in range(size):
                 self.canvas.create_rectangle(
                     x, 10,
@@ -178,12 +162,17 @@ class VisualGameExplorer:
                     fill=color
                 )
                 x += BLOCK_SIZE
-
             x += BLOCK_SPACING
 
-    # -----------------------------
-    # DB Helpers
-    # -----------------------------
+        # Draw inevitable moves as a grey number at the end
+        if inevitable_moves > 0:
+            self.canvas.create_text(
+                x + 20, 10 + BLOCK_HEIGHT // 2,
+                text=f"+{inevitable_moves} inevitable",
+                font=("Arial", 10),
+                fill="grey"
+            )
+
     def load_state(self, canonical, turn):
         self.cur.execute(
             "SELECT winner, layer FROM gamestates WHERE canonical=? AND turn=?",
@@ -200,38 +189,31 @@ class VisualGameExplorer:
         }
 
     def get_children(self, canonical, turn):
-        gaps = parse_gaps(canonical)
-        state = GameState(gaps, turn)
-
+        self.cur.execute(
+            "SELECT child_canonical, child_turn FROM edges WHERE parent_canonical=? AND parent_turn=?",
+            (canonical, turn)
+        )
+        child_rows = self.cur.fetchall()
         children = []
-        for child in state.legal_moves():
-            key = (canonical_str(child), child.turn)
+        for child_canonical, child_turn in child_rows:
             self.cur.execute(
                 "SELECT winner, layer FROM gamestates WHERE canonical=? AND turn=?",
-                key
+                (child_canonical, child_turn)
             )
             row = self.cur.fetchone()
             if row:
                 children.append({
-                    "canonical": key[0],
-                    "turn": key[1],
+                    "canonical": child_canonical,
+                    "turn": child_turn,
                     "winner": row[0],
                     "layer": row[1]
                 })
         return children
 
-    # -----------------------------
-    # UI Logic
-    # -----------------------------
     def display_state(self, state):
         self.current_state = state
-
         self.draw_gaps(state["canonical"])
-
-        self.state_label.config(
-            text=f"Player {state['turn']+1}'s turn"
-        )
-
+        self.state_label.config(text=f"Player {state['turn']+1}'s turn")
         self.info_label.config(
             text=f"Winner tuple: {state['winner']}   |   Layer: {state['layer']}"
         )
@@ -245,12 +227,12 @@ class VisualGameExplorer:
             tk.Label(self.moves_frame, text="Terminal state").pack()
             return
 
-        # Parse current state's winner
-        current_winner = eval(state["winner"])
+        current_winner = json.loads(state["winner"]) if state["winner"] else None
         highlight = self.highlight_enabled.get()
 
         button_placement = 0
-        MAX_ROWS = self.n // 2
+        MAX_ROWS = max(self.n // 2, 1)
+
         for child in children:
             btn = tk.Button(
                 self.moves_frame,
@@ -259,17 +241,14 @@ class VisualGameExplorer:
                 width=50
             )
 
-            if highlight:
-                child_winner = eval(child["winner"])
-                # Winning move condition
+            if highlight and child["winner"]:
+                child_winner = json.loads(child["winner"])
                 if child_winner[2] == 1:
                     btn.config(bg="lightgreen")
 
             row = button_placement % MAX_ROWS
             col = button_placement // MAX_ROWS
-
             button_placement += 1
-
             btn.grid(row=row, column=col, padx=5, pady=5, sticky="ew")
 
     def refresh_state(self):
@@ -293,19 +272,7 @@ class VisualGameExplorer:
             print("Start state not found.")
 
 
-# --------------------------------
-# Query a specific position
-# --------------------------------
-
-
 def get_winner_and_moves(db_path, gaps):
-    """
-    Query the DB for a specific gap layout and list winning moves.
-
-    Args:
-        db_path: Path to the gamestates DB
-        gaps: List of Gap objects or (size, orientation) tuples
-    """
     gaps_list = [g if isinstance(g, Gap) else Gap(*g) for g in gaps]
     state = GameState(gaps_list)
     canonical = canonical_str(state)
@@ -319,27 +286,27 @@ def get_winner_and_moves(db_path, gaps):
         conn.close()
         raise ValueError(f"Gamestate {canonical} not found in DB")
 
-    winner = eval(row[0])
+    winner = json.loads(row[0])
 
+    cur.execute(
+        "SELECT child_canonical, child_turn FROM edges WHERE parent_canonical=? AND parent_turn=?",
+        (canonical, state.turn)
+    )
     winning_moves = []
-    for move_state in state.legal_moves():
-        move_canonical = canonical_str(move_state)
-        cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (move_canonical,))
+    for child_canonical, child_turn in cur.fetchall():
+        cur.execute("SELECT winner FROM gamestates WHERE canonical=? AND turn=?",
+                    (child_canonical, child_turn))
         move_row = cur.fetchone()
-        if move_row:
-            move_winner = eval(move_row[0])
+        if move_row and move_row[0]:
+            move_winner = json.loads(move_row[0])
             if move_winner[2] == 1:
-                winning_moves.append(move_canonical)
+                winning_moves.append(child_canonical)
 
     conn.close()
     return winner, winning_moves
 
-def table_positive_gaps(db_path, max_k):
-    """
-    Generate a table of positive gaps (k, 1) up to max_k.
-    Prints winner tuple and winning moves.
-    """
 
+def table_positive_gaps(db_path, max_k):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
@@ -351,37 +318,34 @@ def table_positive_gaps(db_path, max_k):
         state = GameState(gaps)
         canonical = canonical_str(state)
 
-        # Query ignoring turn
         cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (canonical,))
         row = cur.fetchone()
         if not row:
-            # No such gamestate exists
             print(f"{'+' + str(k):>8} | {'-GameState-not-found-':>25} | {'N/A'}")
             continue
 
-        winner = eval(row[0])
+        winner = json.loads(row[0])
 
-        # Find winning moves
+        cur.execute(
+            "SELECT child_canonical, child_turn FROM edges WHERE parent_canonical=? AND parent_turn=?",
+            (canonical, state.turn)
+        )
         winning_moves = []
-        for move_state in state.legal_moves():
-            move_canonical = canonical_str(move_state)
-            cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (move_canonical,))
+        for child_canonical, child_turn in cur.fetchall():
+            cur.execute("SELECT winner FROM gamestates WHERE canonical=? AND turn=?",
+                        (child_canonical, child_turn))
             move_row = cur.fetchone()
-            if move_row:
-                move_winner = eval(move_row[0])
-                if move_winner[2] == 1:  # previous player wins → current player can force a win
-                    winning_moves.append(move_canonical)
+            if move_row and move_row[0]:
+                move_winner = json.loads(move_row[0])
+                if move_winner[2] == 1:
+                    winning_moves.append(child_canonical)
 
         print(f"{'+' + str(k):>8} | {str(winner):>25} | {winning_moves}")
 
     conn.close()
 
-def table_negative_gaps(db_path, max_k):
-    """
-    Generate a table of negative gaps (-k, -1) up to max_k.
-    Prints winner tuple and winning moves.
-    """
 
+def table_negative_gaps(db_path, max_k):
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
@@ -393,26 +357,27 @@ def table_negative_gaps(db_path, max_k):
         state = GameState(gaps)
         canonical = canonical_str(state)
 
-        # Query ignoring turn
         cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (canonical,))
         row = cur.fetchone()
         if not row:
-            # No such gamestate exists
             print(f"{'-' + str(k) + ', -1':>8} | {'-GameState-not-found-':>25} | {'N/A'}")
             continue
 
-        winner = eval(row[0])
+        winner = json.loads(row[0])
 
-        # Find winning moves
+        cur.execute(
+            "SELECT child_canonical, child_turn FROM edges WHERE parent_canonical=? AND parent_turn=?",
+            (canonical, state.turn)
+        )
         winning_moves = []
-        for move_state in state.legal_moves():
-            move_canonical = canonical_str(move_state)
-            cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (move_canonical,))
+        for child_canonical, child_turn in cur.fetchall():
+            cur.execute("SELECT winner FROM gamestates WHERE canonical=? AND turn=?",
+                        (child_canonical, child_turn))
             move_row = cur.fetchone()
-            if move_row:
-                move_winner = eval(move_row[0])
-                if move_winner[2] == 1:  # previous player wins → current player can force a win
-                    winning_moves.append(move_canonical)
+            if move_row and move_row[0]:
+                move_winner = json.loads(move_row[0])
+                if move_winner[2] == 1:
+                    winning_moves.append(child_canonical)
 
         print(f"{'-' + str(k) + ', -1':>8} | {str(winner):>25} | {winning_moves}")
 
@@ -420,22 +385,14 @@ def table_negative_gaps(db_path, max_k):
 
 
 def table_double_positive_gaps(db_path, max_k, return_df=True):
-    """
-    Generate a table of positive gaps (k,1), (m,1).
-    Prints table and optionally returns a pandas DataFrame.
-    """
-
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
 
     rows = []
-
     print(f"{'Gap':>12} | {'Individual Gap Winners':>30} | {'Winner (curr,next,prev)':>25} | Winning Moves")
     print("-" * 160)
 
     for k in range(1, max_k + 1):
-
-        # --- Individual gap k ---
         gap_1 = [Gap(k, 1)]
         state_1 = GameState(gap_1)
         canonical_1 = canonical_str(state_1)
@@ -443,11 +400,9 @@ def table_double_positive_gaps(db_path, max_k, return_df=True):
         gap1_row = cur.fetchone()
         if not gap1_row:
             continue
-        gap1_winner = eval(gap1_row[0])
+        gap1_winner = json.loads(gap1_row[0])
 
         for m in range(1, k + 1):
-
-            # --- Individual gap m ---
             gap_2 = [Gap(m, 1)]
             state_2 = GameState(gap_2)
             canonical_2 = canonical_str(state_2)
@@ -455,39 +410,38 @@ def table_double_positive_gaps(db_path, max_k, return_df=True):
             gap2_row = cur.fetchone()
             if not gap2_row:
                 continue
-            gap2_winner = eval(gap2_row[0])
+            gap2_winner = json.loads(gap2_row[0])
 
-            # --- Combined state ---
             gaps = [Gap(k, 1), Gap(m, 1)]
             state = GameState(gaps)
             canonical = canonical_str(state)
 
             cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (canonical,))
             row = cur.fetchone()
-
             if not row:
                 print(f"{'+' + str(k) + ', +' + str(m):>12} | {'':>30} | {'-GameState-not-found-':>25} | {'N/A'}")
                 continue
 
-            winner = eval(row[0])
+            winner = json.loads(row[0])
 
-            # --- Find winning moves ---
+            cur.execute(
+                "SELECT child_canonical, child_turn FROM edges WHERE parent_canonical=? AND parent_turn=?",
+                (canonical, state.turn)
+            )
             winning_moves = []
-            for move_state in state.legal_moves():
-                move_canonical = canonical_str(move_state)
-                cur.execute("SELECT winner FROM gamestates WHERE canonical=?", (move_canonical,))
+            for child_canonical, child_turn in cur.fetchall():
+                cur.execute("SELECT winner FROM gamestates WHERE canonical=? AND turn=?",
+                            (child_canonical, child_turn))
                 move_row = cur.fetchone()
-                if move_row:
-                    move_winner = eval(move_row[0])
+                if move_row and move_row[0]:
+                    move_winner = json.loads(move_row[0])
                     if move_winner[2] == 1:
-                        winning_moves.append(move_canonical)
+                        winning_moves.append(child_canonical)
 
             gap_label = f"+{k}, +{m}"
             individual_label = f"{gap1_winner}, {gap2_winner}"
-
             print(f"{gap_label:>12} | {individual_label:>30} | {str(winner):>25} | {winning_moves}")
 
-            # --- Save row for DataFrame ---
             rows.append({
                 "Gap": gap_label,
                 "Gap_k": k,
@@ -501,42 +455,9 @@ def table_double_positive_gaps(db_path, max_k, return_df=True):
     conn.close()
 
     if return_df:
-        df = pd.DataFrame(rows)
-        return df
+        return pd.DataFrame(rows)
+
 
 if __name__ == "__main__":
-    #explorer = CLI_GameExplorer(n=20)
-    #explorer.explore("+20", 0)
-    explorer = VisualGameExplorer(n=20)
-    explorer.start("+20", 0)
-
-
-    db_path = "gamestates_n39.db"
-
-    """
-    # Single +k gap
-    winner, moves = get_winner_and_moves(db_path, [(5, 1)], turn=0)
-    print("Gap +5:", winner)
-    print("Winning moves:", moves)
-
-    # Single -k gap
-    winner, moves = get_winner_and_moves(db_path, [(3, -1)], turn=0)
-    print("Gap -3:", winner)
-    print("Winning moves:", moves)
-
-    # Multi-gap layout
-    winner, moves = get_winner_and_moves(db_path, [(3, 1), (2, -1)], turn=0)
-    print("Layout +3,-2:", winner)
-    print("Winning moves:", moves)
-
-    for k in range(2,19):
-        winner, moves = get_winner_and_moves(db_path, [(k, -1),(1,-1)], turn=0)
-        print(f"Gap -{k}:", winner)
-        print("Winning moves:", moves)
-    """
-
-    # table_positive_gaps(db_path, max_k=30)
-
-    # table_negative_gaps(db_path, max_k=37)
-
-    # df = table_double_positive_gaps(db_path, max_k = 10, return_df = True)
+    explorer = VisualGameExplorer(n=42)
+    explorer.start("+42", 0)

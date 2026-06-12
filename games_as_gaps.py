@@ -18,9 +18,6 @@ class Gap:
     def is_dead(self) -> bool:
         return self.orientation == -1 and self.size == 1
 
-    def layer_of(state: GameState) -> int:
-        return sum(g.size for g in state.gaps) + state.inevitable_moves
-
     def legal_moves(self) -> List[Tuple["Gap", ...]]:
         moves = []
         if self.size <= 0 or self.is_dead():
@@ -106,6 +103,8 @@ class GameState:
         gaps_str = ', '.join(str(g) for g in self.gaps)
         return f"[{gaps_str}] inevitable={self.inevitable_moves} (Player {self.turn + 1}'s turn)"
 
+def layer_of(state: GameState) -> int:
+    return sum(g.size for g in state.gaps) + state.inevitable_moves
 
 # --------------------------
 # CANONICAL STRING FOR SQL
@@ -344,6 +343,130 @@ def build_game_tree(n: int, chunk_size: int = 50000):
     print(f"Done. {time.time() - total_start:.2f}s total.")
     conn.close()
 
+def migrate_db(n: int):
+    import time
+    old_db = f"gamestates_n{n}.db"
+    new_db = f"gamestates_n{n}_reduced.db"
+
+    old_conn = sqlite3.connect(old_db)
+    old_cur = old_conn.cursor()
+
+    new_conn = sqlite3.connect(new_db)
+    new_cur = new_conn.cursor()
+
+    # Set up new DB
+    new_cur.execute("""
+        CREATE TABLE IF NOT EXISTS gamestates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            canonical TEXT NOT NULL,
+            turn INTEGER NOT NULL,
+            layer INTEGER,
+            winner TEXT,
+            UNIQUE(canonical, turn)
+        )
+    """)
+    new_cur.execute("""
+        CREATE TABLE IF NOT EXISTS edges (
+            parent_canonical TEXT NOT NULL,
+            parent_turn INTEGER NOT NULL,
+            child_canonical TEXT NOT NULL,
+            child_turn INTEGER NOT NULL,
+            PRIMARY KEY (parent_canonical, parent_turn, child_canonical, child_turn)
+        )
+    """)
+    new_cur.execute("CREATE INDEX IF NOT EXISTS idx_edges_parent ON edges (parent_canonical, parent_turn)")
+    new_cur.execute("CREATE INDEX IF NOT EXISTS idx_edges_child ON edges (child_canonical, child_turn)")
+    new_cur.execute("CREATE INDEX IF NOT EXISTS idx_gamestates_layer ON gamestates (layer)")
+    new_conn.commit()
+
+    # Helper to reduce an old canonical string to new format
+    def reduce_canonical(canonical: str, turn: int) -> Tuple[str, int, int]:
+        """Returns (new_canonical, new_turn, new_layer)"""
+        # handle old format without inevitable moves
+        if '|' in canonical:
+            gaps_part, inevitable_part = canonical.rsplit('|', 1)
+            inevitable_moves = int(inevitable_part)
+        else:
+            gaps_part = canonical
+            inevitable_moves = 0
+
+        gaps = []
+        for g in gaps_part.split(','):
+            if not g:
+                continue
+            orientation = 1 if g[0] == '+' else -1
+            size = int(g[1:])
+            gaps.append(Gap(size, orientation))
+
+        # Apply reduction
+        state = GameState(gaps, turn, inevitable_moves)
+        new_canonical = canonical_str(state)
+        new_layer = layer_of(state)
+        return new_canonical, state.turn, new_layer
+
+    # Migrate states
+    print("Migrating states...", flush=True)
+    old_cur.execute("SELECT COUNT(*) FROM gamestates")
+    total = old_cur.fetchone()[0]
+    print(f"  {total:,} states to migrate", flush=True)
+
+    old_cur.execute("SELECT canonical, turn, layer, winner FROM gamestates")
+    state_rows = []
+    count = 0
+    start = time.time()
+
+    while True:
+        rows = old_cur.fetchmany(50000)
+        if not rows:
+            break
+        for canonical, turn, layer, winner in rows:
+            new_canonical, new_turn, new_layer = reduce_canonical(canonical, turn)
+            state_rows.append((new_canonical, new_turn, new_layer, winner))
+            count += 1
+
+        new_cur.executemany(
+            "INSERT OR IGNORE INTO gamestates (canonical, turn, layer, winner) VALUES (?, ?, ?, ?)",
+            state_rows
+        )
+        new_conn.commit()
+        state_rows = []
+        print(f"  {count:,} / {total:,} states migrated ({time.time()-start:.1f}s)", flush=True)
+
+    # Migrate edges
+    print("Migrating edges...", flush=True)
+    old_cur.execute("SELECT COUNT(*) FROM edges")
+    total_edges = old_cur.fetchone()[0]
+    print(f"  {total_edges:,} edges to migrate", flush=True)
+
+    old_cur.execute("SELECT parent_canonical, parent_turn, child_canonical, child_turn FROM edges")
+    edge_rows = []
+    count = 0
+
+    while True:
+        rows = old_cur.fetchmany(50000)
+        if not rows:
+            break
+        for parent_canonical, parent_turn, child_canonical, child_turn in rows:
+            new_parent, new_parent_turn, _ = reduce_canonical(parent_canonical, parent_turn)
+            new_child, new_child_turn, _ = reduce_canonical(child_canonical, child_turn)
+            # Skip self-loops that arise from merging
+            if (new_parent, new_parent_turn) != (new_child, new_child_turn):
+                edge_rows.append((new_parent, new_parent_turn, new_child, new_child_turn))
+            count += 1
+
+        new_cur.executemany(
+            "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
+            edge_rows
+        )
+        new_conn.commit()
+        edge_rows = []
+        print(f"  {count:,} / {total_edges:,} edges migrated ({time.time()-start:.1f}s)", flush=True)
+
+    old_conn.close()
+    new_conn.close()
+    print(f"Done. New DB: {new_db}")
+
+
 # ------------------------------------------------------------------------------
 # (OLD) BFS LAYER-BY-LAYER WITH PAUSE/RESUME - creating game tree from single node
 # ------------------------------------------------------------------------------
@@ -416,7 +539,7 @@ def compute_misere_winners(n: int):
 
     Misère rule: last move loses.
     """
-    db_name = f"gamestates_n{n}.db"
+    db_name = f"gamestates_n{n}_reduced.db"
     conn = sqlite3.connect(db_name)
     cur = conn.cursor()
 
@@ -425,13 +548,14 @@ def compute_misere_winners(n: int):
 
     print(f"Computing misère winners from layer {max_layer} → 0...")
 
-    for layer in reversed(range(max_layer + 1)):
+    for layer in range(max_layer + 1):  # process 0, 1, 2, ... max_layer
         cur.execute("SELECT canonical, turn FROM gamestates WHERE layer=?", (layer,))
         rows = cur.fetchall()
         print(f"Processing layer {layer}, {len(rows)} states")
 
         for canonical, turn in rows:
-            state = GameState(parse_gaps(canonical), turn)
+            gaps, inevitable_moves = parse_gaps(canonical)
+            state = GameState(gaps, turn, inevitable_moves)
 
             if state.is_terminal():
                 # Terminal state: last move loses
@@ -662,7 +786,8 @@ def longest_gap_in_missing(n: int, layer: int):
     max_state = None
 
     for (canonical,) in rows:
-        first_gap = parse_gaps(canonical)[0]
+        gaps, inevitable_moves = parse_gaps(canonical)
+        first_gap = gaps[0]
         if first_gap.size > max_size:
             max_size = first_gap.size
             max_state = canonical
