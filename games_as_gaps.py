@@ -194,40 +194,6 @@ def get_db_connection(n: int):
     return conn, cur
 
 
-def reconstruct_seen(cur):
-    cur.execute("SELECT canonical, turn FROM gamestates")
-    return set(cur.fetchall())
-
-
-def insert_layer(states: List[GameState], layer_num: int, cur, conn):
-    state_rows = []
-    edge_rows = []
-    children = []
-    seen_children = set()
-
-    for state in states:
-        canonical = canonical_str(state)
-        state_rows.append((canonical, state.turn, layer_num))
-        for child in state.legal_moves():
-            child_canonical = canonical_str(child)
-            edge_rows.append((canonical, state.turn, child_canonical, child.turn))
-            key = (child_canonical, child.turn)
-            if key not in seen_children:
-                seen_children.add(key)
-                children.append(child)
-
-    cur.executemany(
-        "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
-        state_rows
-    )
-    cur.executemany(
-        "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
-        edge_rows
-    )
-    conn.commit()
-    return children
-
-
 # ------------------------------------------------------------------------------
 # BUILD ALL POSSIBLE GAME STATES (full game tree, not just from one starting node)
 # ------------------------------------------------------------------------------
@@ -236,10 +202,9 @@ def build_game_tree(n: int, chunk_size: int = 50000):
     import time
     conn, cur = get_db_connection(n)
     total_start = time.time()
-    layer_num = 0
 
-    # Layer 0: stream from generator, flush to DB in chunks
-    print(f"Layer 0: streaming signed partitions...")
+    # Layer n: signed partitions of n (starting positions)
+    print(f"Layer {n}: streaming signed partitions...", flush=True)
     layer_start = time.time()
     state_rows = []
     edge_rows = []
@@ -247,7 +212,7 @@ def build_game_tree(n: int, chunk_size: int = 50000):
 
     for state in signed_partitions_gen(n):
         canonical = canonical_str(state)
-        state_rows.append((canonical, state.turn, layer_num))
+        state_rows.append((canonical, state.turn, n))  # layer = n
         for child in state.legal_moves():
             child_canonical = canonical_str(child)
             edge_rows.append((canonical, state.turn, child_canonical, child.turn))
@@ -267,58 +232,48 @@ def build_game_tree(n: int, chunk_size: int = 50000):
             edge_rows = []
             print(f"  flushed {total_states} states...", flush=True)
 
-    # Flush remainder
     if state_rows:
         cur.executemany(
             "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
             state_rows
         )
+    if edge_rows:
         cur.executemany(
             "INSERT OR IGNORE INTO edges (parent_canonical, parent_turn, child_canonical, child_turn) VALUES (?, ?, ?, ?)",
             edge_rows
         )
-        conn.commit()
+    conn.commit()
 
     layer_time = time.time() - layer_start
-    print(f"Layer 0: {total_states} states | {layer_time:.2f}s")
+    print(f"Layer {n}: {total_states} states | {layer_time:.2f}s", flush=True)
 
-    # Remaining layers: read from DB, expand, write children to DB
-    layer_num = 1
-    while True:
-        # Read all states from previous layer
-        cur.execute(
-            "SELECT canonical, turn FROM gamestates WHERE layer=?",
-            (layer_num - 1,)
-        )
-        prev_rows = cur.fetchall()
-        if not prev_rows:
-            break
-
-        # Expand children via edges table — no need to recompute legal_moves
-        cur.execute(
-            """SELECT DISTINCT e.child_canonical, e.child_turn
-               FROM edges e
-               JOIN gamestates g ON g.canonical = e.parent_canonical AND g.turn = e.parent_turn
-               WHERE g.layer = ?""",
-            (layer_num - 1,)
-        )
+    # Remaining layers: n-1 down to 0
+    for layer_num in range(n - 1, -1, -1):
+        # Children of the previous (higher) layer are this layer's states
+        cur.execute("""
+            SELECT DISTINCT e.child_canonical, e.child_turn
+            FROM edges e
+            JOIN gamestates g ON g.canonical = e.parent_canonical
+                              AND g.turn = e.parent_turn
+            WHERE g.layer = ?
+        """, (layer_num + 1,))
         child_rows = cur.fetchall()
 
         if not child_rows:
+            print(f"Layer {layer_num}: no states, stopping.", flush=True)
             break
 
         layer_start = time.time()
         print(f"Layer {layer_num}: {len(child_rows)} states", end="", flush=True)
 
-        # Insert children as new layer, their edges already exist from parent expansion
+        # Insert this layer's states
         cur.executemany(
             "INSERT OR IGNORE INTO gamestates (canonical, turn, layer) VALUES (?, ?, ?)",
             [(c, t, layer_num) for c, t in child_rows]
         )
         conn.commit()
 
-        # Now expand children's edges
-        state_rows = []
+        # Expand edges from this layer's states to their children
         edge_rows = []
         for child_canonical, child_turn in child_rows:
             gaps = parse_gaps(child_canonical)
@@ -326,7 +281,6 @@ def build_game_tree(n: int, chunk_size: int = 50000):
             for grandchild in state.legal_moves():
                 gc_canonical = canonical_str(grandchild)
                 edge_rows.append((child_canonical, child_turn, gc_canonical, grandchild.turn))
-            state_rows.append((child_canonical, child_turn, layer_num))
 
             if len(edge_rows) >= chunk_size * 10:
                 cur.executemany(
@@ -345,74 +299,10 @@ def build_game_tree(n: int, chunk_size: int = 50000):
 
         layer_time = time.time() - layer_start
         total_time = time.time() - total_start
-        print(f" | layer: {layer_time:.2f}s | total: {total_time:.2f}s")
+        print(f" | layer: {layer_time:.2f}s | total: {total_time:.2f}s", flush=True)
 
-        layer_num += 1
-
-    print(f"Done. {layer_num} layers total in {time.time() - total_start:.2f}s.")
+    print(f"Done. {time.time() - total_start:.2f}s total.", flush=True)
     conn.close()
-
-# ------------------------------------------------------------------------------
-# (OLD) BFS LAYER-BY-LAYER WITH PAUSE/RESUME - creating game tree from single node
-# ------------------------------------------------------------------------------
-def bfs_store_sql_resume(root_state: GameState, cur, conn):
-    seen = reconstruct_seen(cur)
-
-    cur.execute("SELECT MAX(layer) FROM gamestates")
-    result = cur.fetchone()
-    max_layer = result[0] if result[0] is not None else -1
-
-    if max_layer == -1:
-        # Fresh start
-        current_layer = [root_state]
-        layer_num = 0
-    else:
-        # Check if max_layer was fully expanded by seeing if max_layer+1 exists
-        cur.execute("SELECT COUNT(*) FROM gamestates WHERE layer=?", (max_layer + 1,))
-        next_layer_exists = cur.fetchone()[0] > 0
-
-        if next_layer_exists:
-            # max_layer was fully expanded; resume from max_layer+1
-            resume_layer = max_layer + 1
-        else:
-            # max_layer may be incomplete; roll back and re-expand from max_layer-1
-            cur.execute("DELETE FROM gamestates WHERE layer=?", (max_layer,))
-            conn.commit()
-            seen = reconstruct_seen(cur)  # rebuild seen after deletion
-            resume_layer = max_layer  # will re-expand layer max_layer-1 into it
-
-        cur.execute("SELECT canonical, turn FROM gamestates WHERE layer=?", (resume_layer - 1,))
-        rows = cur.fetchall()
-        current_layer = []
-        for canonical, turn in rows:
-            gaps = []
-            for g in (canonical or "").split(','):
-                if not g:
-                    continue
-                orientation = 1 if g[0] == '+' else -1
-                size = int(g[1:])
-                gaps.append(Gap(size, orientation))
-            current_layer.append(GameState(gaps, turn))
-        layer_num = resume_layer
-
-    # BFS loop
-    while current_layer:
-        print(f"Processing layer {layer_num}, {len(current_layer)} states")
-        insert_layer(current_layer, layer_num, cur, conn)
-
-        next_layer = []
-        for state in current_layer:
-            for next_state in state.legal_moves():
-                key = (next_state.canonical(), next_state.turn)
-                if key not in seen:
-                    seen.add(key)
-                    next_layer.append(next_state)
-
-        current_layer = next_layer
-        layer_num += 1
-
-    print(f"Finished BFS. Total layers: {layer_num}")
-
 
 # --------------------------
 # DETERMINING WINNER FROM LAST LAYER
@@ -423,17 +313,19 @@ def compute_misere_winners(n: int):
     in gamestates_n{n}.db and updates the 'winner' column.
 
     Misère rule: last move loses.
+    Layer 0 = terminal states, layer n = starting positions.
+    Process low layers first so children are always labeled before parents.
     """
-    db_name = f"gamestates_n{n}.db"
+    db_name = os.path.join(os.getcwd(), f"gamestates_n{n}.db")
     conn = sqlite3.connect(db_name)
     cur = conn.cursor()
 
     cur.execute("SELECT MAX(layer) FROM gamestates")
     max_layer = cur.fetchone()[0]
 
-    print(f"Computing misère winners from layer {max_layer} → 0...")
+    print(f"Computing misère winners from layer 0 → {max_layer}...")
 
-    for layer in reversed(range(max_layer + 1)):
+    for layer in range(max_layer + 1):
         cur.execute("SELECT canonical, turn FROM gamestates WHERE layer=?", (layer,))
         rows = cur.fetchall()
         print(f"Processing layer {layer}, {len(rows)} states")
@@ -445,8 +337,6 @@ def compute_misere_winners(n: int):
                 # Terminal state: last move loses
                 winner = [1, 1, 0]
             else:
-                # Fetch all children via edges table
-                # Non-terminal: get child winners
                 cur.execute(
                     """SELECT child_canonical, child_turn FROM edges
                        WHERE parent_canonical=? AND parent_turn=?""",
@@ -467,9 +357,9 @@ def compute_misere_winners(n: int):
                         child_statuses.append([0, 0, 0])
 
                 # Apply 3-player misère propagation
-                # prev = all children next
-                # curr = any children prev
-                # next = all children curr
+                # curr = any child has prev winning (c[2])
+                # next = all children have curr winning (c[0])
+                # prev = all children have next winning (c[1])
                 prev_val = int(all(c[1] for c in child_statuses))
                 curr_val = int(any(c[2] for c in child_statuses))
                 next_val = int(all(c[0] for c in child_statuses))
@@ -484,138 +374,6 @@ def compute_misere_winners(n: int):
 
     print("Finished computing misère winners.")
     conn.close()
-
-
-
-def Get_Gamegraph_and_Strategy(n):
-    conn, cur = get_db_connection(n)
-
-    # Confirm table exists
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
-    print("Tables in DB:", cur.fetchall())
-
-    root_state = GameState([Gap(n, 1)], 0)
-    bfs_store_sql_resume(root_state, cur, conn)
-
-    # Count total states
-    cur.execute("SELECT COUNT(*) FROM gamestates")
-    total_states = cur.fetchone()[0]
-    print(f"Total unique game states stored in gamestates_n{n}.db: {total_states}")
-
-    # Compute winning strategy
-    compute_misere_winners(n)
-
-    # Example query: print root state winner
-    conn = sqlite3.connect(f"gamestates_n{n}.db")
-    cur = conn.cursor()
-    cur.execute("SELECT winner FROM gamestates WHERE layer=0")
-    print("Root state winner:", cur.fetchone()[0])
-    conn.close()
-
-
-
-def filter_nodes_with_target_child(n: int, layer: int, target_winner: list = [0, 0, 0]) -> List[GameState]:
-    """
-    For each node in `layer`, check if any child is terminal with the given winner value.
-    Returns the list of parent nodes where such a child exists.
-    """
-    conn, cur = get_db_connection(n)
-    target_str = json.dumps(target_winner)
-
-    # Load all nodes in the given layer
-    cur.execute("SELECT canonical, turn FROM gamestates WHERE layer=?", (layer,))
-    rows = cur.fetchall()
-
-    matching_parents = []
-
-    for canonical, turn in rows:
-        # Reconstruct parent state
-        gaps = []
-        for g in (canonical or "").split(','):
-            if not g:
-                continue
-            orientation = 1 if g[0] == '+' else -1
-            size = int(g[1:])
-            gaps.append(Gap(size, orientation))
-        state = GameState(gaps, turn)
-
-        # Check each child
-        for child in state.legal_moves():
-            child_canonical = canonical_str(child)
-            cur.execute(
-                "SELECT winner, layer FROM gamestates WHERE canonical=? AND turn=?",
-                (child_canonical, child.turn)
-            )
-            row = cur.fetchone()
-            if row is None:
-                continue
-            child_winner, child_layer = row
-
-            # Check: terminal (layer+1 has no children, i.e. child is in max layer or is_terminal)
-            # We use child.is_terminal() since we have the object already
-            if child_winner == target_str:
-                matching_parents.append(state)
-                break  # no need to check further children
-
-    conn.close()
-    print(f"Layer {layer}: {len(matching_parents)} / {len(rows)} nodes have a terminal child with winner {target_winner}")
-    return matching_parents
-
-    # Example usage:
-    # for k in range(6):
-    #     filter_nodes_with_target_child(n=43,layer=k)
-    ## Layer 0: 1 / 1 nodes have a terminal child with winner [0, 0, 0]
-    ## Layer 1: 43 / 43 nodes have a terminal child with winner [0, 0, 0]
-    ## Layer 2: 581 / 581 nodes have a terminal child with winner [0, 0, 0]
-    ## Layer 3: 3980 / 3980 nodes have a terminal child with winner [0, 0, 0]
-    ## Layer 4: 16469 / 16469 nodes have a terminal child with winner [0, 0, 0]
-    ## Layer 5: 46814 / 46829 nodes have a terminal child with winner [0, 0, 0]
-
-
-# ------------------------------------------------------------------------------
-# Querying nodes with grandchildren [0,x,x] fully in SQL to save memory/time
-# ------------------------------------------------------------------------------
-
-def check_grandchildren_winners_sql(n: int, layer: int):
-    conn, cur = get_db_connection(n)
-
-    grandchild_layer = layer + 2
-
-    cur.execute("""
-        SELECT canonical, turn
-        FROM gamestates
-        WHERE layer = ?
-        AND (canonical, turn) NOT IN (
-            SELECT DISTINCT e.parent_canonical, e.parent_turn
-            FROM edges e
-            WHERE (e.child_canonical, e.child_turn) IN (
-                SELECT DISTINCT e2.parent_canonical, e2.parent_turn
-                FROM edges e2
-                WHERE (e2.child_canonical, e2.child_turn) IN (
-                    SELECT canonical, turn
-                    FROM gamestates
-                    WHERE layer = ?
-                    AND json_extract(winner, '$[0]') = 0
-                )
-            )
-        )
-    """, (layer, grandchild_layer))
-
-    missing = cur.fetchall()
-
-    cur.execute("SELECT COUNT(*) FROM gamestates WHERE layer=?", (layer,))
-    total = cur.fetchone()[0]
-
-    conn.close()
-
-    print(f"Layer {layer}: {total - len(missing)}/{total} states have a grandchild with winner[0]==0")
-    if missing:
-        print(f"  {len(missing)} states do NOT:")
-        #for canonical, turn in missing:
-        #    print(f"    {canonical} turn={turn}")
-    return missing
-
-
 
 
 # --------------------------
