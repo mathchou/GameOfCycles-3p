@@ -305,6 +305,95 @@ def build_game_tree(n: int, chunk_size: int = 50000):
     conn.close()
 
 # --------------------------
+# Adding in a column with reduced canonical forms to gamestates_n.db
+# --------------------------
+
+INEVITABLE_MOVES = {
+    (1, 1): 1,   # +1: 1 move
+    (2, 1): 2,   # +2: 2 moves
+    (2, -1): 1,  # -2: 1 move
+    (3, -1): 2,  # -3: 2 moves
+    (4, -1): 3,  # -4: 3 moves
+}
+
+def compute_reduced_canonical(canonical: str) -> str:
+    """
+    Given a canonical string (e.g. '+5,+3,+2,-1'), strips out inevitable gaps
+    and dead gaps, sums their move counts, and returns a reduced form:
+        'live_gaps|inevitable_mod3'
+    e.g. '+5,+3|1'
+    """
+    if not canonical:
+        return '|0'
+
+    live_parts = []
+    total_inevitable = 0
+
+    for g in canonical.split(','):
+        if not g:
+            continue
+        orientation = 1 if g[0] == '+' else -1
+        size = int(g[1:])
+
+        if orientation == -1 and size == 1:
+            pass  # dead gap, drop silently
+        elif (size, orientation) in INEVITABLE_MOVES:
+            total_inevitable += INEVITABLE_MOVES[(size, orientation)]
+        else:
+            live_parts.append(g)
+
+    return '|'.join([','.join(live_parts), str(total_inevitable)])
+
+
+def add_reduced_canonical_column(n: int):
+    """
+    Adds a 'reduced_canonical' column to gamestates_n{n}.db and populates it.
+    Safe to re-run — skips if column already exists.
+    """
+    db_path = os.path.join(os.getcwd(), f"gamestates_n{n}.db")
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+
+    # Add column if missing
+    cur.execute("PRAGMA table_info(gamestates)")
+    cols = [r[1] for r in cur.fetchall()]
+    if 'reduced_canonical' not in cols:
+        cur.execute("ALTER TABLE gamestates ADD COLUMN reduced_canonical TEXT")
+        conn.commit()
+        print("Added reduced_canonical column.")
+    else:
+        print("Column already exists, repopulating...")
+
+    # Populate in batches
+    cur.execute("SELECT canonical FROM gamestates WHERE reduced_canonical IS NULL")
+    rows = cur.fetchall()
+    print(f"Computing reduced_canonical for {len(rows):,} rows...")
+
+    batch = []
+    for (canonical,) in rows:
+        batch.append((compute_reduced_canonical(canonical), canonical))
+        if len(batch) >= 50000:
+            cur.executemany(
+                "UPDATE gamestates SET reduced_canonical=? WHERE canonical=?",
+                batch
+            )
+            conn.commit()
+            batch = []
+
+    if batch:
+        cur.executemany(
+            "UPDATE gamestates SET reduced_canonical=? WHERE canonical=?",
+            batch
+        )
+        conn.commit()
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_reduced_canonical ON gamestates(reduced_canonical)")
+    conn.commit()
+    print("Done.")
+    conn.close()
+
+
+# --------------------------
 # DETERMINING WINNER FROM LAST LAYER
 # --------------------------
 def compute_misere_winners(n: int):

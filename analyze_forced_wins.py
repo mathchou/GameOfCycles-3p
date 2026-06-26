@@ -2,6 +2,7 @@ import sqlite3
 import json
 import os
 from collections import defaultdict
+from games_as_gaps import compute_reduced_canonical
 
 
 def analyze_forced_p1_wins(n: int, k: int):
@@ -13,19 +14,18 @@ def analyze_forced_p1_wins(n: int, k: int):
     chain that cannot be escaped even at the grandparent level.
 
     Outputs:
-      - Console: counts at each stage
+      - Console: counts at each stage + unique reduced_canonical forms
       - JSON file: failing layer-k nodes + cant-escape grandparents
     """
     db_path = os.path.join(os.getcwd(), f"gamestates_n{n}.db")
     print(f"Connecting to {db_path}")
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA cache_size = -65536")   # 64 MB page cache
+    conn.execute("PRAGMA cache_size = -65536")  # 64 MB page cache
     conn.execute("PRAGMA temp_store = MEMORY")
 
     try:
         # ----------------------------------------------------------------
         # STEP 1: Layer-k nodes with winner[0]=1
-        # Pull winner[0] directly in SQL to avoid JSON parsing in Python
         # ----------------------------------------------------------------
         print(f"\n=== STEP 1: Layer {k} nodes with winner[0]=1 ===")
         cur = conn.execute("""
@@ -36,7 +36,7 @@ def analyze_forced_p1_wins(n: int, k: int):
               AND json_extract(winner, '$[0]') = 1
         """, (k,))
         rows = cur.fetchall()
-        layer_k_nodes = {r[0]: r[1] for r in rows}   # canonical -> winner str
+        layer_k_nodes = {r[0]: r[1] for r in rows}  # canonical -> winner str
         print(f"  Found {len(layer_k_nodes):,} nodes")
 
         if not layer_k_nodes:
@@ -47,17 +47,12 @@ def analyze_forced_p1_wins(n: int, k: int):
         # STEP 2: Parents of those nodes; classify by whether any child
         #         has winner[0]=0.
         #
-        # Key optimisation: do everything in a single SQL pass using
-        # GROUP BY + MIN(json_extract) to avoid fetching all child rows.
-        # MIN(json_extract(winner,'$[0]')) = 0  iff at least one child
-        # has winner[0]=0, which is exactly "can escape".
+        # GROUP BY + MIN(json_extract): min=0 iff at least one child has
+        # winner[0]=0, which is exactly "can escape".
         # ----------------------------------------------------------------
-        print(f"\n=== STEP 2: Parents (layer {k+1}) ===")
-        layer_k_list = list(layer_k_nodes.keys())
-        _create_temp_table(conn, "tmp_layer_k", layer_k_list)
+        print(f"\n=== STEP 2: Parents (layer {k + 1}) ===")
+        _create_temp_table(conn, "tmp_layer_k", list(layer_k_nodes.keys()))
 
-        # All children of these parents are in layer k, so one pass suffices:
-        # group by parent and check if any child has winner[0]=0.
         cur = conn.execute("""
             SELECT
                 e.parent_canonical,
@@ -68,18 +63,17 @@ def analyze_forced_p1_wins(n: int, k: int):
                                AND gc.winner IS NOT NULL
             GROUP BY e.parent_canonical
         """)
-        # min_p1 = 0 means at least one child has winner[0]=0 → can escape
         rows = cur.fetchall()
         print(f"  Found {len(rows):,} distinct parents")
         if not rows:
             print("No parents found.")
-            _write_json(n, k, [], [])
+            _write_json(n, k, [], [], [])
             return
 
         cant_escape_parents = []
         can_escape_count = 0
         for row in rows:
-            if row[1] == 0:   # min winner[0] across children is 0 → can escape
+            if row[1] == 0:
                 can_escape_count += 1
             else:
                 cant_escape_parents.append(row[0])
@@ -89,13 +83,13 @@ def analyze_forced_p1_wins(n: int, k: int):
 
         if not cant_escape_parents:
             print("All parents can escape. No propagation needed.")
-            _write_json(n, k, [], [])
+            _write_json(n, k, [], [], [])
             return
 
         # ----------------------------------------------------------------
         # STEP 3: Grandparents of cant_escape_parents
         # ----------------------------------------------------------------
-        print(f"\n=== STEP 3: Grandparents (layer {k+2}) ===")
+        print(f"\n=== STEP 3: Grandparents (layer {k + 2}) ===")
         _create_temp_table(conn, "tmp_cant_escape_parents", cant_escape_parents)
 
         cur = conn.execute("""
@@ -108,15 +102,12 @@ def analyze_forced_p1_wins(n: int, k: int):
 
         if not grandparent_canonicals:
             print("No grandparents found.")
-            _write_json(n, k, [], [])
+            _write_json(n, k, [], [], [])
             return
 
         # ----------------------------------------------------------------
         # STEP 4: For each grandparent, does ANY grandchild have winner[0]=0?
-        #         (via any child, not just cant_escape_parents)
-        #
-        # Two-hop join: grandparent -> child -> grandchild
-        # Again use MIN(json_extract) trick.
+        #         Two-hop join: grandparent -> child -> grandchild
         # ----------------------------------------------------------------
         print(f"\n=== STEP 4: Checking grandchildren of grandparents ===")
         _create_temp_table(conn, "tmp_grandparents", grandparent_canonicals)
@@ -146,13 +137,12 @@ def analyze_forced_p1_wins(n: int, k: int):
         # ----------------------------------------------------------------
         # STEP 5: Trace back — which layer-k nodes are downstream of a
         #         cant_escape_grandparent?
-        #
-        # Path: grandparent (cant escape) -> cant_escape_parent -> layer-k node
+        # Path: cant_escape_grandparent -> cant_escape_parent -> layer-k node
         # ----------------------------------------------------------------
         print(f"\n=== STEP 5: Tracing failing layer-k nodes ===")
         if not cant_escape_grandparents:
             print("  No cant-escape grandparents — no layer-k nodes fail the full chain.")
-            _write_json(n, k, [], [])
+            _write_json(n, k, [], [], [])
             return
 
         _create_temp_table(conn, "tmp_cant_escape_gp", cant_escape_grandparents)
@@ -160,31 +150,39 @@ def analyze_forced_p1_wins(n: int, k: int):
         cur = conn.execute("""
             SELECT DISTINCT e2.child_canonical AS layer_k_canonical
             FROM edges e1
-            JOIN tmp_cant_escape_gp tcg   ON tcg.canonical = e1.parent_canonical
-            JOIN tmp_cant_escape_parents tcp ON tcp.canonical = e1.child_canonical
-            JOIN edges e2                 ON e2.parent_canonical = e1.child_canonical
-            JOIN tmp_layer_k tlk          ON tlk.canonical = e2.child_canonical
+            JOIN tmp_cant_escape_gp tcg      ON tcg.canonical = e1.parent_canonical
+            JOIN tmp_cant_escape_parents tcp  ON tcp.canonical = e1.child_canonical
+            JOIN edges e2                     ON e2.parent_canonical = e1.child_canonical
+            JOIN tmp_layer_k tlk              ON tlk.canonical = e2.child_canonical
         """)
         failing_k_canonicals = [r[0] for r in cur.fetchall()]
         print(f"  Layer-{k} nodes that fail the full chain: {len(failing_k_canonicals):,}")
 
-        # Attach winner vectors for output
         failing_k_nodes = [
-            {"canonical": c, "winner": json.loads(layer_k_nodes[c])}
+            {
+                "canonical": c,
+                "winner": json.loads(layer_k_nodes[c]),
+                "reduced_canonical": compute_reduced_canonical(c),
+            }
             for c in failing_k_canonicals
             if c in layer_k_nodes
         ]
+
+        unique_reduced = sorted(set(node["reduced_canonical"] for node in failing_k_nodes))
 
         # ----------------------------------------------------------------
         # SUMMARY + OUTPUT
         # ----------------------------------------------------------------
         print(f"\n=== SUMMARY ===")
         print(f"  Layer {k}   — nodes with winner[0]=1:          {len(layer_k_nodes):,}")
-        print(f"  Layer {k+1} — parents that cannot escape:       {len(cant_escape_parents):,}")
-        print(f"  Layer {k+2} — grandparents that cannot escape:  {len(cant_escape_grandparents):,}")
+        print(f"  Layer {k + 1} — parents that cannot escape:       {len(cant_escape_parents):,}")
+        print(f"  Layer {k + 2} — grandparents that cannot escape:  {len(cant_escape_grandparents):,}")
         print(f"  Layer {k}   — nodes failing full chain:         {len(failing_k_nodes):,}")
+        print(f"\n  Unique reduced_canonical forms ({len(unique_reduced)}):")
+        for rc in unique_reduced:
+            print(f"    {rc}")
 
-        _write_json(n, k, failing_k_nodes, cant_escape_grandparents)
+        _write_json(n, k, failing_k_nodes, cant_escape_grandparents, unique_reduced)
 
     finally:
         conn.close()
@@ -202,7 +200,7 @@ def _create_temp_table(conn: sqlite3.Connection, name: str, values: list):
                      ((v,) for v in values))
 
 
-def _write_json(n: int, k: int, failing_nodes: list, cant_escape_gps: list):
+def _write_json(n: int, k: int, failing_nodes: list, cant_escape_gps: list, unique_reduced: list):
     filename = f"forced_p1_wins_n{n}_layer{k}.json"
     path = os.path.join(os.getcwd(), filename)
     output = {
@@ -210,6 +208,7 @@ def _write_json(n: int, k: int, failing_nodes: list, cant_escape_gps: list):
         "layer_k": k,
         "failing_layer_k_count": len(failing_nodes),
         "cant_escape_grandparent_count": len(cant_escape_gps),
+        "unique_reduced_canonical_forms": unique_reduced,
         "failing_layer_k_nodes": failing_nodes,
         "cant_escape_grandparents": cant_escape_gps,
     }
