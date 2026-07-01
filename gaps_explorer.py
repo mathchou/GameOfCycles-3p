@@ -1,4 +1,4 @@
-from games_as_gaps import *
+from full_rep_games_as_gaps import *
 import tkinter as tk
 import sqlite3
 import pandas as pd
@@ -507,8 +507,8 @@ def table_double_positive_gaps(db_path, max_k, return_df=True):
 if __name__ == "__main__":
     #explorer = CLI_GameExplorer(n=20)
     #explorer.explore("+20", 0)
-    explorer = VisualGameExplorer(n=25)
-    explorer.start("+25")
+    explorer = VisualGameExplorer(n=33)
+    explorer.start("+33")
 
 
     db_path = "gamestates_n39.db"
