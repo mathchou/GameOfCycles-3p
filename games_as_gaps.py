@@ -321,7 +321,7 @@ def compute_reduced_canonical(canonical: str) -> str:
     Given a canonical string (e.g. '+5,+3,+2,-1'), strips out inevitable gaps
     and dead gaps, sums their move counts, and returns a reduced form:
         'live_gaps|inevitable_mod3'
-    e.g. '+5,+3|1'
+    e.g. '+5,+3|2'
     """
     if not canonical:
         return '|0'
@@ -342,7 +342,7 @@ def compute_reduced_canonical(canonical: str) -> str:
         else:
             live_parts.append(g)
 
-    return '|'.join([','.join(live_parts), str(total_inevitable)])
+    return '|'.join([','.join(live_parts), str(total_inevitable % 3)])
 
 
 def add_reduced_canonical_column(n: int):
