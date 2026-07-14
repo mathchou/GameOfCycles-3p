@@ -194,10 +194,26 @@ def build_indices(conn):
     print("Building indices...", flush=True)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_parent ON edges (parent_reduced, parent_layer, parent_turn)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_child ON edges (child_reduced, child_layer, child_turn)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_parent_layer ON edges (parent_layer)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_child_layer ON edges (child_layer)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_gamestates_layer ON gamestates (layer)")
     conn.commit()
     print("Indices built.", flush=True)
 
+
+def add_layer_indices(n: int):
+    db_path = os.path.join(os.getcwd(), f"reduced_gamestates_n{n}.db")
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA cache_size = -524288")  # 512 MB
+    conn.execute("PRAGMA temp_store = MEMORY")
+    print(f"Adding layer indices to reduced_gamestates_n{n}.db...")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_parent_layer ON edges (parent_layer)")
+    print("  parent_layer index done")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_child_layer ON edges (child_layer)")
+    print("  child_layer index done")
+    conn.commit()
+    conn.close()
+    print("Done.")
 
 # --------------------------
 # BUILD REDUCED GAME TREE
