@@ -1,0 +1,427 @@
+
+<style>
+* { box-sizing: border-box; }
+#app { padding: 12px; font-family: var(--font-sans); }
+#controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+#controls label { font-size: 13px; color: var(--text-secondary); }
+#info-bar { font-size: 13px; color: var(--text-secondary); margin-bottom: 8px; min-height: 18px; }
+#canvas-wrap { overflow: hidden; border: 0.5px solid var(--border); border-radius: var(--radius); background: var(--surface-1); }
+canvas { display: block; }
+#tooltip { position: fixed; display: none; background: var(--surface-2); border: 0.5px solid var(--border-strong); border-radius: var(--radius); padding: 8px 10px; font-size: 12px; color: var(--text-primary); pointer-events: none; max-width: 280px; z-index: 999; line-height: 1.6; }
+#legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; align-items: center; }
+.leg { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); }
+.leg-dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
+#hint { font-size: 11px; color: var(--text-muted); margin-top: 4px; }
+</style>
+
+<div id="app">
+  <h2 class="sr-only">Game of Cycles — avoidability chain viewer</h2>
+  <div id="controls">
+    <label>Load JSON: <input type="file" id="file-in" accept=".json"></label>
+    <button onclick="resetView()">Reset view</button>
+    <button onclick="clearSelection()">Clear selection</button>
+    <button onclick="exportPNG()">Export PNG</button>
+    <button onclick="loadSample()">Load sample ↗</button>
+  </div>
+  <div id="info-bar">Load a mark_avoidable JSON file, or click "Load sample".</div>
+  <div id="canvas-wrap"><canvas id="c" width="900" height="500"></canvas></div>
+  <div id="legend">
+    <div class="leg"><div class="leg-dot" style="background:#888780"></div>Origin</div>
+    <div class="leg"><div class="leg-dot" style="background:#1D9E75"></div>Cleared (1 round)</div>
+    <div class="leg"><div class="leg-dot" style="background:#378ADD"></div>Cleared (multi-round)</div>
+    <div class="leg"><div class="leg-dot" style="background:#E24B4A"></div>Failed</div>
+    <div class="leg"><div class="leg-dot" style="background:#888780; opacity:0.3"></div>Collapsed</div>
+  </div>
+  <div id="hint">Click node to select subtree • Double-click to collapse/expand • Drag to pan • Scroll to zoom</div>
+</div>
+<div id="tooltip"></div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+const infoBar = document.getElementById('info-bar');
+
+const NODE_W = 170, NODE_H = 32, COL_W = 210, ROW_H = 44;
+
+let nodes = [], edges = [];
+let pan = {x: 40, y: 40}, scale = 1;
+let dragging = false, lastMouse = null, hoveredNode = null;
+let selectedId = null;   // clicked node id
+let collapsed = new Set(); // node ids that are collapsed
+
+function nodeColor(n) {
+  if (n.isOrigin) return '#888780';
+  if (!n.cleared) return '#E24B4A';
+  if (n.hasDeepChildren) return '#378ADD';
+  return '#1D9E75';
+}
+
+// --- Subtree helpers ---
+function getDescendants(id, result = new Set()) {
+  result.add(id);
+  for (const e of edges) {
+    if (e.from === id && !result.has(e.to)) getDescendants(e.to, result);
+  }
+  return result;
+}
+
+function getAncestors(id, result = new Set()) {
+  result.add(id);
+  for (const e of edges) {
+    if (e.to === id && !result.has(e.from)) getAncestors(e.from, result);
+  }
+  return result;
+}
+
+function getHighlighted() {
+  if (!selectedId) return null;
+  const desc = getDescendants(selectedId);
+  const anc = getAncestors(selectedId);
+  return new Set([...desc, ...anc]);
+}
+
+// Nodes hidden because an ancestor is collapsed
+function getHidden() {
+  const hidden = new Set();
+  for (const cid of collapsed) {
+    // children of collapsed nodes (not the node itself)
+    for (const e of edges) {
+      if (e.from === cid) {
+        getDescendants(e.to).forEach(id => hidden.add(id));
+      }
+    }
+  }
+  return hidden;
+}
+
+function hasVisibleChildren(nodeId, hidden) {
+  return edges.some(e => e.from === nodeId && !hidden.has(e.to));
+}
+
+// --- Build graph ---
+function buildGraph(data) {
+  nodes = []; edges = []; collapsed.clear(); selectedId = null;
+  const byCol = {};
+
+  function addNode(rc, round, outcome, cleared, hasDeepChildren, isOrigin) {
+    const id = rc + '§' + round;
+    if (nodes.find(n => n.id === id)) return id;
+    const n = { id, rc, round, outcome: outcome || '', cleared: cleared !== false, hasDeepChildren: !!hasDeepChildren, isOrigin: !!isOrigin, x: 0, y: 0 };
+    nodes.push(n);
+    (byCol[round] = byCol[round] || []).push(n);
+    return id;
+  }
+
+  function addEdge(from, to) {
+    if (from && to && from !== to && !edges.find(e => e.from === from && e.to === to))
+      edges.push({ from, to });
+  }
+
+  function walk(histArr, parentId) {
+    if (!histArr || !histArr.length) return;
+    for (const entry of histArr) {
+      if (!entry || !entry.node) continue;
+      const hasDeep = !!(entry.children && entry.children.some(c =>
+        c.history && c.history.some(h => h.children && h.children.length)));
+      const id = addNode(entry.node, entry.round, entry.outcome, true, hasDeep, false);
+      addEdge(parentId, id);
+      if (entry.children) {
+        for (const child of entry.children) {
+          if (!child || !child.child) continue;
+          walk(child.history, id);
+        }
+      }
+    }
+  }
+
+  const originId = addNode(data.start_rc, 0, data.proven_avoidable ? 'avoidable' : 'failed', data.proven_avoidable, false, true);
+  if (data.history) {
+    walk(data.history, originId);
+    for (const h of data.history) {
+      if (h.node && h.round) addEdge(originId, h.node + '§' + h.round);
+    }
+  }
+
+  // Layout
+  const cols = Object.keys(byCol).map(Number).sort((a, b) => a - b);
+  for (const col of cols) {
+    byCol[col].forEach((n, i) => { n.x = col * COL_W; n.y = i * ROW_H; });
+  }
+
+  resizeCanvas();
+  infoBar.textContent = `${data.start_rc}  •  avoidable: ${data.proven_avoidable}  •  ${nodes.length} nodes  •  ${Math.max(...nodes.map(n => n.round))} rounds`;
+  draw();
+}
+
+function resizeCanvas() {
+  if (!nodes.length) return;
+  const hidden = getHidden();
+  const vis = nodes.filter(n => !hidden.has(n.id));
+  const maxX = Math.max(...vis.map(n => n.x)) + NODE_W + 80;
+  const maxY = Math.max(...vis.map(n => n.y)) + NODE_H + 60;
+  canvas.width = Math.max(900, maxX);
+  canvas.height = Math.max(400, maxY);
+}
+
+// --- Draw ---
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.translate(pan.x, pan.y);
+  ctx.scale(scale, scale);
+
+  const hidden = getHidden();
+  const highlighted = getHighlighted();
+
+  // Edges
+  for (const e of edges) {
+    if (hidden.has(e.from) || hidden.has(e.to)) continue;
+    const from = nodes.find(n => n.id === e.from);
+    const to = nodes.find(n => n.id === e.to);
+    if (!from || !to) continue;
+
+    const dimmed = highlighted && (!highlighted.has(e.from) || !highlighted.has(e.to));
+    const x1 = from.x + NODE_W, y1 = from.y + NODE_H / 2;
+    const x2 = to.x, y2 = to.y + NODE_H / 2;
+    const mx = (x1 + x2) / 2;
+
+    ctx.beginPath();
+    ctx.strokeStyle = dimmed ? '#88878022' : nodeColor(to) + '55';
+    ctx.lineWidth = dimmed ? 0.4 : 0.9;
+    ctx.moveTo(x1, y1);
+    ctx.bezierCurveTo(mx, y1, mx, y2, x2, y2);
+    ctx.stroke();
+  }
+
+  // Nodes
+  for (const n of nodes) {
+    if (hidden.has(n.id)) continue;
+    const color = nodeColor(n);
+    const isHover = hoveredNode === n;
+    const isSelected = selectedId === n.id;
+    const dimmed = highlighted && !highlighted.has(n.id);
+    const isCollapsed = collapsed.has(n.id);
+    const hasChildren = edges.some(e => e.from === n.id);
+
+    const alpha = dimmed ? '10' : (isSelected ? '40' : '1a');
+    ctx.beginPath();
+    roundRect(ctx, n.x, n.y, NODE_W, NODE_H, 5);
+    ctx.fillStyle = color + alpha;
+    ctx.fill();
+    ctx.strokeStyle = isSelected ? color : (dimmed ? color + '22' : color + (isHover ? 'cc' : '66'));
+    ctx.lineWidth = isSelected ? 2 : (isHover ? 1.2 : 0.7);
+    ctx.stroke();
+
+    // Collapse indicator
+    if (hasChildren) {
+      const cx = n.x + NODE_W - 10, cy = n.y + NODE_H / 2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+      ctx.fillStyle = isCollapsed ? color + 'cc' : color + '44';
+      ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 8px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(isCollapsed ? '+' : '−', cx, cy);
+    }
+
+    ctx.fillStyle = dimmed ? color + '44' : color;
+    ctx.font = `${isSelected || isHover ? 500 : 400} 11px var(--font-sans, sans-serif)`;
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    const maxLen = hasChildren ? 21 : 24;
+    const label = n.rc.length > maxLen ? n.rc.slice(0, maxLen - 1) + '…' : n.rc;
+    ctx.fillText(label, n.x + 7, n.y + 5);
+
+    ctx.fillStyle = dimmed ? color + '33' : color + 'aa';
+    ctx.font = '9.5px var(--font-sans, sans-serif)';
+    ctx.fillText(n.isOrigin ? 'origin · r0' : `r${n.round}`, n.x + 7, n.y + 18);
+  }
+
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function getNodeAt(mx, my) {
+  const wx = (mx - pan.x) / scale, wy = (my - pan.y) / scale;
+  const hidden = getHidden();
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (hidden.has(n.id)) continue;
+    if (wx >= n.x && wx <= n.x + NODE_W && wy >= n.y && wy <= n.y + NODE_H) return n;
+  }
+  return null;
+}
+
+// --- Events ---
+let lastClick = 0, lastClickId = null;
+
+canvas.addEventListener('click', e => {
+  const r = canvas.getBoundingClientRect();
+  const n = getNodeAt(e.clientX - r.left, e.clientY - r.top);
+  const now = Date.now();
+  if (n && now - lastClick < 350 && lastClickId === n.id) {
+    // Double-click: toggle collapse
+    if (collapsed.has(n.id)) collapsed.delete(n.id);
+    else collapsed.add(n.id);
+    resizeCanvas();
+    draw();
+  } else {
+    // Single click: select subtree
+    selectedId = (selectedId === n?.id) ? null : (n?.id || null);
+    draw();
+  }
+  lastClick = now;
+  lastClickId = n?.id || null;
+});
+
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  if (dragging && lastMouse) {
+    pan.x += e.clientX - lastMouse.x;
+    pan.y += e.clientY - lastMouse.y;
+    lastMouse = { x: e.clientX, y: e.clientY };
+    draw(); return;
+  }
+  const n = getNodeAt(mx, my);
+  if (n !== hoveredNode) { hoveredNode = n; draw(); }
+  if (n) {
+    tooltip.style.display = 'block';
+    tooltip.style.left = (e.clientX + 14) + 'px';
+    tooltip.style.top = (e.clientY - 8) + 'px';
+    const childCount = edges.filter(e2 => e2.from === n.id).length;
+    tooltip.innerHTML = `<strong>${n.rc}</strong><br>Round: ${n.round}<br>Outcome: ${n.outcome || '—'}<br>Children: ${childCount}${collapsed.has(n.id) ? ' (collapsed)' : ''}`;
+  } else {
+    tooltip.style.display = 'none';
+  }
+});
+
+canvas.addEventListener('mousedown', e => {
+  dragging = true; lastMouse = { x: e.clientX, y: e.clientY };
+  canvas.style.cursor = 'grabbing';
+});
+window.addEventListener('mouseup', () => {
+  dragging = false; canvas.style.cursor = 'grab'; lastMouse = null;
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const factor = e.deltaY > 0 ? 0.88 : 1.14;
+  const newScale = Math.max(0.1, Math.min(5, scale * factor));
+  pan.x = mx - (mx - pan.x) * (newScale / scale);
+  pan.y = my - (my - pan.y) * (newScale / scale);
+  scale = newScale; draw();
+}, { passive: false });
+
+function resetView() { pan = { x: 40, y: 40 }; scale = 1; draw(); }
+function clearSelection() { selectedId = null; draw(); }
+
+function exportPNG() {
+  // Render to offscreen canvas without pan/scale for full tree
+  const hidden = getHidden();
+  const vis = nodes.filter(n => !hidden.has(n.id));
+  if (!vis.length) return;
+  const pad = 40;
+  const minX = Math.min(...vis.map(n => n.x)) - pad;
+  const minY = Math.min(...vis.map(n => n.y)) - pad;
+  const maxX = Math.max(...vis.map(n => n.x + NODE_W)) + pad;
+  const maxY = Math.max(...vis.map(n => n.y + NODE_H)) + pad;
+  const W = maxX - minX, H = maxY - minY;
+
+  const oc = document.createElement('canvas');
+  oc.width = W; oc.height = H;
+  const oc2 = oc.getContext('2d');
+  oc2.fillStyle = '#ffffff';
+  oc2.fillRect(0, 0, W, H);
+  oc2.translate(-minX, -minY);
+
+  // Draw edges
+  for (const e of edges) {
+    if (hidden.has(e.from) || hidden.has(e.to)) continue;
+    const from = nodes.find(n => n.id === e.from);
+    const to = nodes.find(n => n.id === e.to);
+    if (!from || !to) continue;
+    const x1 = from.x + NODE_W, y1 = from.y + NODE_H / 2;
+    const x2 = to.x, y2 = to.y + NODE_H / 2;
+    const mx2 = (x1 + x2) / 2;
+    oc2.beginPath();
+    oc2.strokeStyle = nodeColor(to) + '55';
+    oc2.lineWidth = 0.9;
+    oc2.moveTo(x1, y1); oc2.bezierCurveTo(mx2, y1, mx2, y2, x2, y2); oc2.stroke();
+  }
+
+  // Draw nodes
+  for (const n of vis) {
+    const color = nodeColor(n);
+    oc2.beginPath(); roundRectCtx(oc2, n.x, n.y, NODE_W, NODE_H, 5);
+    oc2.fillStyle = color + '1a'; oc2.fill();
+    oc2.strokeStyle = color + '88'; oc2.lineWidth = 0.8; oc2.stroke();
+    oc2.fillStyle = color;
+    oc2.font = '400 11px Arial, sans-serif';
+    oc2.textBaseline = 'top'; oc2.textAlign = 'left';
+    const label = n.rc.length > 24 ? n.rc.slice(0, 22) + '…' : n.rc;
+    oc2.fillText(label, n.x + 7, n.y + 5);
+    oc2.fillStyle = color + 'aa';
+    oc2.font = '9.5px Arial, sans-serif';
+    oc2.fillText(n.isOrigin ? 'origin' : `r${n.round}`, n.x + 7, n.y + 18);
+  }
+
+  const a = document.createElement('a');
+  a.download = 'chain_tree.png';
+  a.href = oc.toDataURL('image/png');
+  a.click();
+}
+
+function roundRectCtx(c, x, y, w, h, r) {
+  c.beginPath(); c.moveTo(x+r,y); c.arcTo(x+w,y,x+w,y+h,r); c.arcTo(x+w,y+h,x,y+h,r); c.arcTo(x,y+h,x,y,r); c.arcTo(x,y,x+w,y,r); c.closePath();
+}
+
+// --- Sample ---
+function loadSample() {
+  buildGraph({
+    n: 50, start_rc: '-10,+3,+3|1', start_layer: 20,
+    proven_avoidable: true, max_rounds: 10,
+    history: [{ node: '-10,+3,+3|1', round: 1, outcome: 'cleared',
+      children: [
+        { child: '+21|0', cleared: true, history: [{ node: '+21|0', round: 2, outcome: 'cleared - all grandparents escape' }] },
+        { child: '-18,+4|0', cleared: true, history: [{ node: '-18,+4|0', round: 2, outcome: 'cleared - all grandparents escape' }] },
+        { child: '-10,+9|1', cleared: true, history: [{ node: '-10,+9|1', round: 2, outcome: 'cleared',
+          children: [
+            { child: '-10,+9,+4|0', cleared: true, history: [{ node: '-10,+9,+4|0', round: 3, outcome: 'cleared - all grandparents escape' }] },
+            { child: '-14,-10|0', cleared: true, history: [{ node: '-14,-10|0', round: 3, outcome: 'cleared - all grandparents escape' }] },
+            { child: '+12,-10|1', cleared: true, history: [{ node: '+12,-10|1', round: 3, outcome: 'cleared - all grandparents escape' }] }
+          ]
+        }] },
+        { child: '-14,+3|3', cleared: true, history: [{ node: '-14,+3|3', round: 2, outcome: 'cleared',
+          children: [
+            { child: '-14,+5|4', cleared: true, history: [{ node: '-14,+5|4', round: 3, outcome: 'cleared',
+              children: [
+                { child: '-14,+7|5', cleared: true, history: [{ node: '-14,+7|5', round: 4, outcome: 'cleared - all grandparents escape' }] },
+                { child: '-20|6', cleared: true, history: [{ node: '-20|6', round: 4, outcome: 'cleared - all grandparents escape' }] },
+                { child: '-14,+5|7', cleared: true, history: [{ node: '-14,+5|7', round: 4, outcome: 'cleared - all grandparents escape' }] }
+              ]
+            }] },
+            { child: '-18|5', cleared: false, history: [{ node: '-18|5', round: 3, outcome: 'failed - limit reached' }] }
+          ]
+        }] }
+      ]
+    }]
+  });
+}
+
+canvas.style.cursor = 'grab';
+draw();
+</script>

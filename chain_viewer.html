@@ -1,0 +1,297 @@
+
+<style>
+* { box-sizing: border-box; }
+body { margin: 0; }
+#app { padding: 12px; font-family: var(--font-sans); }
+#controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+#controls input[type=file] { font-size: 13px; color: var(--text-secondary); }
+#controls label { font-size: 13px; color: var(--text-secondary); }
+#info-bar { font-size: 13px; color: var(--text-secondary); margin-bottom: 8px; min-height: 18px; }
+#canvas-wrap { overflow: auto; border: 0.5px solid var(--border); border-radius: var(--radius); background: var(--surface-1); }
+canvas { display: block; cursor: grab; }
+canvas.grabbing { cursor: grabbing; }
+#tooltip { position: fixed; display: none; background: var(--surface-2); border: 0.5px solid var(--border-strong); border-radius: var(--radius); padding: 8px 10px; font-size: 12px; color: var(--text-primary); pointer-events: none; max-width: 260px; z-index: 999; line-height: 1.5; }
+#legend { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 8px; }
+.leg { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); }
+.leg-dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+</style>
+
+<div id="app">
+  <h2 class="sr-only">Game of Cycles chain viewer — interactive backward chain tree</h2>
+  <div id="controls">
+    <label>Load JSON: <input type="file" id="file-in" accept=".json"></label>
+    <button onclick="resetView()">Reset view</button>
+    <button onclick="loadSample()">Load sample ↗</button>
+  </div>
+  <div id="info-bar">Load a mark_avoidable JSON file to begin.</div>
+  <div id="canvas-wrap">
+    <canvas id="c" width="900" height="500"></canvas>
+  </div>
+  <div id="legend">
+    <div class="leg"><div class="leg-dot" style="background:#1D9E75"></div>Cleared (1 round)</div>
+    <div class="leg"><div class="leg-dot" style="background:#378ADD"></div>Needs propagation</div>
+    <div class="leg"><div class="leg-dot" style="background:#E24B4A"></div>Failed / limit reached</div>
+    <div class="leg"><div class="leg-dot" style="background:#888780"></div>Origin node</div>
+  </div>
+</div>
+<div id="tooltip"></div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+const infoBar = document.getElementById('info-bar');
+
+let nodes = [], edges = [], pan = {x: 40, y: 40}, scale = 1;
+let dragging = false, lastMouse = null;
+let hoveredNode = null;
+
+const COL = {
+  cleared: '#1D9E75',
+  propagate: '#378ADD',
+  failed: '#E24B4A',
+  origin: '#888780',
+  edge: '#B4B2A9',
+  edgeActive: '#378ADD',
+  nodeBg: getComputedStyle(document.documentElement).getPropertyValue('--surface-2').trim() || '#fff',
+  text: getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim() || '#222',
+  textSec: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim() || '#666',
+};
+
+function nodeColor(n) {
+  if (n.isOrigin) return COL.origin;
+  if (n.outcome === 'cleared' || n.outcome?.includes('cleared') || n.outcome?.includes('escape') || n.outcome?.includes('avoidable')) return COL.cleared;
+  if (n.outcome === 'continuing') return COL.propagate;
+  if (n.outcome === 'failed' || n.outcome?.includes('limit')) return COL.failed;
+  if (n.hasChildren) return COL.propagate;
+  return COL.cleared;
+}
+
+function buildGraph(data) {
+  nodes = [];
+  edges = [];
+  const nodeMap = {};
+
+  function ensureNode(rc, layer, extra = {}) {
+    const id = rc + '|' + layer;
+    if (!nodeMap[id]) {
+      const n = { id, rc, layer, ...extra, x: 0, y: 0, w: 0, h: 36 };
+      nodeMap[id] = n;
+      nodes.push(n);
+    } else {
+      Object.assign(nodeMap[id], extra);
+    }
+    return nodeMap[id];
+  }
+
+  // Origin node
+  const origin = ensureNode(data.start_rc, data.start_layer, {
+    isOrigin: true,
+    outcome: data.proven_avoidable ? 'avoidable' : 'failed',
+    winner: null,
+    mod3: data.start_rc_mod3
+  });
+
+  // Walk history tree recursively
+  function walkHistory(histArr, parentId) {
+    if (!histArr) return;
+    for (const entry of histArr) {
+      const nId = entry.node + '|' + (entry.round * 3 + data.start_layer - 3);
+      const n = ensureNode(entry.node, entry.round, {
+        outcome: entry.outcome,
+        round: entry.round,
+        hasChildren: !!(entry.children && entry.children.length),
+      });
+      if (parentId && parentId !== n.id) {
+        edges.push({ from: parentId, to: n.id, active: entry.outcome !== 'failed' });
+      }
+      if (entry.children) {
+        for (const child of entry.children) {
+          walkHistory([{ node: child.child, round: entry.round + 1, outcome: child.cleared ? 'cleared' : 'failed', children: child.history }], n.id);
+        }
+      }
+    }
+  }
+
+  walkHistory(data.history, origin.id);
+
+  // Layout: group by round
+  const byRound = {};
+  for (const n of nodes) {
+    const r = n.isOrigin ? 0 : (n.round || 0);
+    (byRound[r] = byRound[r] || []).push(n);
+  }
+
+  const rounds = Object.keys(byRound).map(Number).sort((a, b) => a - b);
+  const colW = 220, rowH = 60;
+  for (const r of rounds) {
+    const group = byRound[r];
+    for (let i = 0; i < group.length; i++) {
+      group[i].x = r * colW;
+      group[i].y = i * rowH;
+    }
+  }
+
+  // Measure canvas
+  const maxX = Math.max(...nodes.map(n => n.x)) + 200;
+  const maxY = Math.max(...nodes.map(n => n.y)) + 60;
+  canvas.width = Math.max(900, maxX + 80);
+  canvas.height = Math.max(400, maxY + 80);
+
+  infoBar.textContent = `${data.start_rc}  •  proven avoidable: ${data.proven_avoidable}  •  ${nodes.length} nodes`;
+  draw();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.translate(pan.x, pan.y);
+  ctx.scale(scale, scale);
+
+  // Edges
+  for (const e of edges) {
+    const from = nodes.find(n => n.id === e.from);
+    const to = nodes.find(n => n.id === e.to);
+    if (!from || !to) continue;
+    ctx.beginPath();
+    ctx.strokeStyle = e.active ? COL.edgeActive : COL.edge;
+    ctx.globalAlpha = e.active ? 0.6 : 0.3;
+    ctx.lineWidth = e.active ? 1.5 : 0.8;
+    const x1 = from.x + 180, y1 = from.y + 18;
+    const x2 = to.x, y2 = to.y + 18;
+    const mx = (x1 + x2) / 2;
+    ctx.moveTo(x1, y1);
+    ctx.bezierCurveTo(mx, y1, mx, y2, x2, y2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+
+  // Nodes
+  for (const n of nodes) {
+    const color = nodeColor(n);
+    const isHover = hoveredNode === n;
+    const w = 180, h = 34;
+    n.w = w;
+
+    ctx.beginPath();
+    roundRect(ctx, n.x, n.y, w, h, 6);
+    ctx.fillStyle = isHover ? color + 'dd' : color + '22';
+    ctx.fill();
+    ctx.strokeStyle = isHover ? color : color + '88';
+    ctx.lineWidth = isHover ? 1.5 : 0.8;
+    ctx.stroke();
+
+    ctx.fillStyle = isHover ? color : (color + 'cc');
+    ctx.font = `${isHover ? 500 : 400} 11px var(--font-sans, sans-serif)`;
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    const label = n.rc.length > 22 ? n.rc.slice(0, 20) + '…' : n.rc;
+    ctx.fillText(label, n.x + 8, n.y + 12);
+
+    ctx.fillStyle = COL.textSec;
+    ctx.font = '10px var(--font-sans, sans-serif)';
+    const sub = n.isOrigin ? 'origin' : (n.outcome || '');
+    ctx.fillText(sub.length > 26 ? sub.slice(0, 24) + '…' : sub, n.x + 8, n.y + 25);
+  }
+
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function getNodeAt(mx, my) {
+  const wx = (mx - pan.x) / scale, wy = (my - pan.y) / scale;
+  for (const n of nodes) {
+    if (wx >= n.x && wx <= n.x + n.w && wy >= n.y && wy <= n.y + n.h) return n;
+  }
+  return null;
+}
+
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  if (dragging && lastMouse) {
+    pan.x += e.clientX - lastMouse.x;
+    pan.y += e.clientY - lastMouse.y;
+    lastMouse = { x: e.clientX, y: e.clientY };
+    draw();
+    return;
+  }
+  const n = getNodeAt(mx, my);
+  hoveredNode = n;
+  if (n) {
+    tooltip.style.display = 'block';
+    tooltip.style.left = (e.clientX + 12) + 'px';
+    tooltip.style.top = (e.clientY - 10) + 'px';
+    tooltip.innerHTML = `<strong>${n.rc}</strong><br>Layer: ${n.layer}<br>Outcome: ${n.outcome || '—'}<br>${n.mod3 ? 'mod3: ' + n.mod3 : ''}`;
+  } else {
+    tooltip.style.display = 'none';
+  }
+  draw();
+});
+
+canvas.addEventListener('mousedown', e => {
+  dragging = true;
+  lastMouse = { x: e.clientX, y: e.clientY };
+  canvas.classList.add('grabbing');
+});
+window.addEventListener('mouseup', () => { dragging = false; canvas.classList.remove('grabbing'); lastMouse = null; });
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const delta = e.deltaY > 0 ? 0.9 : 1.1;
+  const wx = (mx - pan.x), wy = (my - pan.y);
+  scale = Math.max(0.2, Math.min(3, scale * delta));
+  pan.x = mx - wx * (scale / (scale / delta));
+  pan.y = my - wy * (scale / (scale / delta));
+  draw();
+}, { passive: false });
+
+function resetView() { pan = { x: 40, y: 40 }; scale = 1; draw(); }
+
+document.getElementById('file-in').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try {
+      const data = JSON.parse(ev.target.result);
+      buildGraph(data);
+    } catch(err) {
+      infoBar.textContent = 'Error parsing JSON: ' + err.message;
+    }
+  };
+  reader.readAsText(f);
+});
+
+function loadSample() {
+  const sample = {
+    n: 50, start_rc: '+11,-6|3', start_rc_mod3: '+11,-6|0',
+    start_layer: 23, proven_avoidable: true, max_rounds: 5,
+    history: [{
+      node: '+11,-6|3', round: 1, outcome: 'cleared - all grandparents escape',
+      children: [
+        { child: '+12,-7|4', cleared: true, history: [{ node: '+12,-7|4', round: 2, outcome: 'cleared', children: [] }] },
+        { child: '+11,-8|3', cleared: true, history: [{ node: '+11,-8|3', round: 2, outcome: 'cleared', children: [
+          { child: '+13,-9|2', cleared: true, history: [{ node: '+13,-9|2', round: 3, outcome: 'cleared', children: [] }] },
+          { child: '+12,-9|1', cleared: false, history: [{ node: '+12,-9|1', round: 3, outcome: 'failed', children: [] }] }
+        ]}] },
+        { child: '+11,-7|5', cleared: true, history: [{ node: '+11,-7|5', round: 2, outcome: 'cleared - all grandparents escape', children: [] }] }
+      ]
+    }]
+  };
+  buildGraph(sample);
+}
+
+// Initial draw
+draw();
+</script>

@@ -215,6 +215,30 @@ def add_layer_indices(n: int):
     conn.close()
     print("Done.")
 
+
+def add_composite_indices(n: int):
+    db_path = os.path.join(os.getcwd(), f"reduced_gamestates_n{n}.db")
+    conn = sqlite3.connect(db_path)
+    #conn.execute("PRAGMA cache_size = -524288")  # 512 MB
+    conn.execute("PRAGMA cache_size = -8388608")  # 8 GB
+    conn.execute("PRAGMA temp_store = MEMORY")
+
+    print(f"Adding composite indices to reduced_gamestates_n{n}.db...")
+
+    import time
+    t0 = time.time()
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_child_layer_reduced ON edges (child_layer, child_reduced)")
+    print(f"  idx_edges_child_layer_reduced done: {time.time() - t0:.2f}s")
+
+    t0 = time.time()
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_parent_layer_reduced ON edges (parent_layer, parent_reduced)")
+    print(f"  idx_edges_parent_layer_reduced done: {time.time() - t0:.2f}s")
+
+    conn.commit()
+    conn.close()
+    print("Done.")
+
+
 # --------------------------
 # BUILD REDUCED GAME TREE
 # --------------------------

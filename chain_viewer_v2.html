@@ -1,0 +1,274 @@
+
+<style>
+* { box-sizing: border-box; }
+#app { padding: 12px; font-family: var(--font-sans); }
+#controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+#controls label { font-size: 13px; color: var(--text-secondary); }
+#info-bar { font-size: 13px; color: var(--text-secondary); margin-bottom: 8px; min-height: 18px; }
+#canvas-wrap { overflow: auto; border: 0.5px solid var(--border); border-radius: var(--radius); background: var(--surface-1); }
+canvas { display: block; }
+canvas.grabbing { cursor: grabbing; }
+canvas { cursor: grab; }
+#tooltip { position: fixed; display: none; background: var(--surface-2); border: 0.5px solid var(--border-strong); border-radius: var(--radius); padding: 8px 10px; font-size: 12px; color: var(--text-primary); pointer-events: none; max-width: 280px; z-index: 999; line-height: 1.6; }
+#legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 8px; }
+.leg { display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-secondary); }
+.leg-dot { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
+</style>
+
+<div id="app">
+  <h2 class="sr-only">Game of Cycles — avoidability chain viewer</h2>
+  <div id="controls">
+    <label>Load JSON: <input type="file" id="file-in" accept=".json"></label>
+    <button onclick="resetView()">Reset view</button>
+    <button onclick="loadSample()">Load sample ↗</button>
+  </div>
+  <div id="info-bar">Load a mark_avoidable JSON file, or click "Load sample".</div>
+  <div id="canvas-wrap"><canvas id="c" width="900" height="500"></canvas></div>
+  <div id="legend">
+    <div class="leg"><div class="leg-dot" style="background:#888780"></div>Origin</div>
+    <div class="leg"><div class="leg-dot" style="background:#1D9E75"></div>Cleared (1 round)</div>
+    <div class="leg"><div class="leg-dot" style="background:#378ADD"></div>Cleared (multi-round)</div>
+    <div class="leg"><div class="leg-dot" style="background:#E24B4A"></div>Failed / limit</div>
+  </div>
+</div>
+<div id="tooltip"></div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const tooltip = document.getElementById('tooltip');
+const infoBar = document.getElementById('info-bar');
+
+let nodes = [], edges = [];
+let pan = {x: 40, y: 40}, scale = 1;
+let dragging = false, lastMouse = null, hoveredNode = null;
+
+const NODE_W = 170, NODE_H = 32, COL_W = 210, ROW_H = 44;
+
+function nodeColor(n) {
+  if (n.isOrigin) return '#888780';
+  if (!n.cleared && n.outcome?.includes('limit')) return '#E24B4A';
+  if (!n.cleared) return '#E24B4A';
+  if (n.hasDeepChildren) return '#378ADD';
+  return '#1D9E75';
+}
+
+function buildGraph(data) {
+  nodes = []; edges = [];
+  const byCol = {};  // col index -> [{node}]
+
+  function addNode(rc, round, outcome, cleared, hasDeepChildren, isOrigin) {
+    const id = rc + '§' + round;
+    if (nodes.find(n => n.id === id)) return id;
+    const n = { id, rc, round, outcome: outcome || '', cleared: cleared !== false, hasDeepChildren: !!hasDeepChildren, isOrigin: !!isOrigin, x: 0, y: 0 };
+    nodes.push(n);
+    const col = round;
+    (byCol[col] = byCol[col] || []).push(n);
+    return id;
+  }
+
+  function walk(histArr, parentId) {
+    if (!histArr || !histArr.length) return;
+    for (const entry of histArr) {
+      if (!entry || !entry.node) continue;
+      const hasDeep = !!(entry.children && entry.children.some(c => c.history && c.history.some(h => h.children && h.children.length)));
+      const id = addNode(entry.node, entry.round, entry.outcome, true, hasDeep, false);
+      if (parentId && parentId !== id) {
+        if (!edges.find(e => e.from === parentId && e.to === id))
+          edges.push({ from: parentId, to: id, cleared: true });
+      }
+      if (entry.children) {
+        for (const child of entry.children) {
+          if (!child || !child.child) continue;
+          walk(child.history, id);
+        }
+      }
+    }
+  }
+
+  // Origin node at round 0
+  const originId = addNode(data.start_rc, 0, data.proven_avoidable ? 'avoidable' : 'failed', data.proven_avoidable, false, true);
+  if (data.history && data.history.length) {
+    walk(data.history, originId);
+    // Also connect origin to round-1 nodes that appear in history
+    for (const h of data.history) {
+      if (h.node && h.round) {
+        const tid = h.node + '§' + h.round;
+        if (!edges.find(e => e.from === originId && e.to === tid))
+          edges.push({ from: originId, to: tid, cleared: true });
+      }
+    }
+  }
+
+  // Layout
+  const cols = Object.keys(byCol).map(Number).sort((a, b) => a - b);
+  for (const col of cols) {
+    const group = byCol[col];
+    for (let i = 0; i < group.length; i++) {
+      group[i].x = col * COL_W;
+      group[i].y = i * ROW_H;
+    }
+  }
+
+  const maxX = Math.max(...nodes.map(n => n.x)) + NODE_W + 60;
+  const maxY = Math.max(...nodes.map(n => n.y)) + NODE_H + 60;
+  canvas.width = Math.max(900, maxX);
+  canvas.height = Math.max(400, maxY);
+
+  const totalNodes = nodes.length, maxRound = Math.max(...nodes.map(n => n.round));
+  infoBar.textContent = `${data.start_rc}  •  avoidable: ${data.proven_avoidable}  •  ${totalNodes} nodes  •  ${maxRound} rounds`;
+  draw();
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.save();
+  ctx.translate(pan.x, pan.y);
+  ctx.scale(scale, scale);
+
+  // Draw edges
+  for (const e of edges) {
+    const from = nodes.find(n => n.id === e.from);
+    const to = nodes.find(n => n.id === e.to);
+    if (!from || !to) continue;
+    const x1 = from.x + NODE_W, y1 = from.y + NODE_H / 2;
+    const x2 = to.x, y2 = to.y + NODE_H / 2;
+    const mx = (x1 + x2) / 2;
+    ctx.beginPath();
+    ctx.strokeStyle = nodeColor(to) + '66';
+    ctx.lineWidth = 0.8;
+    ctx.moveTo(x1, y1);
+    ctx.bezierCurveTo(mx, y1, mx, y2, x2, y2);
+    ctx.stroke();
+  }
+
+  // Draw nodes
+  for (const n of nodes) {
+    const color = nodeColor(n);
+    const isHover = hoveredNode === n;
+    ctx.beginPath();
+    roundRect(ctx, n.x, n.y, NODE_W, NODE_H, 5);
+    ctx.fillStyle = color + (isHover ? '33' : '18');
+    ctx.fill();
+    ctx.strokeStyle = isHover ? color : color + '77';
+    ctx.lineWidth = isHover ? 1.5 : 0.7;
+    ctx.stroke();
+
+    // Label
+    ctx.fillStyle = color;
+    ctx.font = `${isHover ? 500 : 400} 11px var(--font-sans, sans-serif)`;
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    const label = n.rc.length > 24 ? n.rc.slice(0, 22) + '…' : n.rc;
+    ctx.fillText(label, n.x + 7, n.y + 5);
+
+    ctx.fillStyle = color + 'aa';
+    ctx.font = '9.5px var(--font-sans, sans-serif)';
+    const sub = n.isOrigin ? 'origin · r0' : `r${n.round}`;
+    ctx.fillText(sub, n.x + 7, n.y + 18);
+  }
+
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function getNodeAt(mx, my) {
+  const wx = (mx - pan.x) / scale, wy = (my - pan.y) / scale;
+  for (let i = nodes.length - 1; i >= 0; i--) {
+    const n = nodes[i];
+    if (wx >= n.x && wx <= n.x + NODE_W && wy >= n.y && wy <= n.y + NODE_H) return n;
+  }
+  return null;
+}
+
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  if (dragging && lastMouse) {
+    pan.x += e.clientX - lastMouse.x;
+    pan.y += e.clientY - lastMouse.y;
+    lastMouse = { x: e.clientX, y: e.clientY };
+    draw(); return;
+  }
+  const n = getNodeAt(mx, my);
+  if (n !== hoveredNode) { hoveredNode = n; draw(); }
+  if (n) {
+    tooltip.style.display = 'block';
+    tooltip.style.left = (e.clientX + 14) + 'px';
+    tooltip.style.top = (e.clientY - 8) + 'px';
+    tooltip.innerHTML = `<strong>${n.rc}</strong><br>Round: ${n.round}<br>Outcome: ${n.outcome || '—'}<br>Cleared: ${n.cleared}`;
+  } else {
+    tooltip.style.display = 'none';
+  }
+});
+
+canvas.addEventListener('mousedown', e => { dragging = true; lastMouse = { x: e.clientX, y: e.clientY }; canvas.classList.add('grabbing'); });
+window.addEventListener('mouseup', () => { dragging = false; canvas.classList.remove('grabbing'); lastMouse = null; });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const r = canvas.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const factor = e.deltaY > 0 ? 0.88 : 1.14;
+  const newScale = Math.max(0.15, Math.min(4, scale * factor));
+  pan.x = mx - (mx - pan.x) * (newScale / scale);
+  pan.y = my - (my - pan.y) * (newScale / scale);
+  scale = newScale;
+  draw();
+}, { passive: false });
+
+function resetView() { pan = { x: 40, y: 40 }; scale = 1; draw(); }
+
+document.getElementById('file-in').addEventListener('change', e => {
+  const f = e.target.files[0]; if (!f) return;
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try { buildGraph(JSON.parse(ev.target.result)); }
+    catch(err) { infoBar.textContent = 'Error: ' + err.message; }
+  };
+  reader.readAsText(f);
+});
+
+function loadSample() {
+  buildGraph({
+    n: 50, start_rc: '-10,+3,+3|1', start_layer: 20,
+    proven_avoidable: true, max_rounds: 10,
+    history: [{
+      node: '-10,+3,+3|1', round: 1, outcome: 'cleared',
+      children: [
+        { child: '+21|0', cleared: true, history: [{ node: '+21|0', round: 2, outcome: 'cleared - all grandparents escape' }] },
+        { child: '-18,+4|0', cleared: true, history: [{ node: '-18,+4|0', round: 2, outcome: 'cleared - all grandparents escape' }] },
+        { child: '-10,+9|1', cleared: true, history: [{
+          node: '-10,+9|1', round: 2, outcome: 'cleared',
+          children: [
+            { child: '-10,+9,+4|0', cleared: true, history: [{ node: '-10,+9,+4|0', round: 3, outcome: 'cleared - all grandparents escape' }] },
+            { child: '-14,-10|0', cleared: true, history: [{ node: '-14,-10|0', round: 3, outcome: 'cleared - all grandparents escape' }] }
+          ]
+        }] },
+        { child: '-14,+3|3', cleared: true, history: [{
+          node: '-14,+3|3', round: 2, outcome: 'cleared',
+          children: [
+            { child: '-14,+5|4', cleared: true, history: [{
+              node: '-14,+5|4', round: 3, outcome: 'cleared',
+              children: [
+                { child: '-14,+7|5', cleared: true, history: [{ node: '-14,+7|5', round: 4, outcome: 'cleared - all grandparents escape' }] },
+                { child: '-20|6', cleared: true, history: [{ node: '-20|6', round: 4, outcome: 'cleared - all grandparents escape' }] }
+              ]
+            }] }
+          ]
+        }] }
+      ]
+    }]
+  });
+}
+
+draw();
+</script>
