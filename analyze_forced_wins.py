@@ -131,16 +131,6 @@ def _find_parents(conn, canonicals: list, tmp_name: str):
     """)
     return cur.fetchall()
 
-def _has_children(history: list) -> bool:
-    """Check if the history tree has any child nodes."""
-    if not history:
-        return False
-    for entry in history:
-        if entry.get("children"):
-            return True
-    return False
-
-
 # -------------------------------------------------------------------------------------------
 # Here, we want to have players A and B keep the parity of the remaining moves to be 1 mod 3
 # for player C's turn. However, this is only possible if the game board is "big enough".
@@ -219,12 +209,23 @@ def dedup_by_inevitable_mod3(new_target: list) -> list:
 # --------------------------------------
 # Backward Grandparent Analysis
 # --------------------------------------
+def _mark_node_avoidable(conn, rc: str):
+    """Mark a single reduced canonical as avoidable in DB and avoidable_mod3 table."""
+    conn.execute("""
+        UPDATE gamestates SET avoidable = 1
+        WHERE reduced_canonical = ? AND avoidable IS NULL
+    """, (rc,))
+    conn.execute("""
+        INSERT OR IGNORE INTO avoidable_mod3 VALUES (?)
+    """, (reduced_canonical_mod3(rc),))
+
 
 def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds, current_round, live_moves_fn):
     """
     Recursively propagate a single node until it's cleared or max_rounds is reached.
     Returns (cleared, history) where history is a list of round dicts.
     Mod3-identical nodes are kept in history as leaves but not recursed into.
+    Any node that clears is immediately marked avoidable in the DB.
     """
     if current_round > max_rounds:
         return False, []
@@ -240,6 +241,7 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds, curre
         return False, [{"node": node_rc, "round": current_round, "outcome": "computational limit"}]
 
     if not cant_escape:
+        _mark_node_avoidable(conn, node_rc)
         return True, [{"node": node_rc, "round": current_round, "outcome": "cleared - all grandparents escape"}]
 
     cant_escape = dedup_by_inevitable_mod3(cant_escape)
@@ -256,6 +258,7 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds, curre
     """).fetchall()
 
     if not cant_escape:
+        _mark_node_avoidable(conn, node_rc)
         return True, [{"node": node_rc, "round": current_round, "outcome": "cleared - all cant-escape already avoidable"}]
 
     cant_escape_layer = node_layer + 2
@@ -283,16 +286,23 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds, curre
         if (rc, layer) not in set(loop_nodes)
     ]
 
-    if not new_nodes and not loop_nodes:
-        return True, [{"node": node_rc, "round": current_round, "outcome": "cleared - new target empty after filtering"}]
+    if not new_nodes:
+        # Either everything was filtered out, or only loop nodes remain.
+        # Loop nodes are excluded from propagation by design, so the node clears.
+        _mark_node_avoidable(conn, node_rc)
+        outcome = "cleared - new target empty after filtering" if not loop_nodes else "cleared - only loop nodes remain"
+        return True, [{"node": node_rc, "round": current_round, "outcome": outcome,
+                       "children": [{"child": rc, "cleared": False,
+                                     "history": [{"node": rc, "round": current_round + 1,
+                                                  "outcome": "loop - mod3 identical to origin"}]}
+                                    for rc, _ in loop_nodes]}]
 
     # Sort by live_moves descending
     new_nodes = sorted(new_nodes, key=lambda x: live_moves_fn(x[0]), reverse=True)
 
-    # Build children list — loop nodes as leaves, others recursed
+    # Build children — loop nodes as leaves, others recursed
     children = []
 
-    # Add loop nodes as non-recursive leaves
     for child_rc, child_layer in loop_nodes:
         children.append({
             "child": child_rc,
@@ -304,7 +314,6 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds, curre
             }]
         })
 
-    # Recurse into non-loop nodes
     all_cleared = True
     for child_rc, child_layer in new_nodes:
         child_cleared, child_history = _propagate_node(
@@ -319,7 +328,9 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds, curre
         if not child_cleared:
             all_cleared = False
 
-    # Loop nodes don't affect cleared status — they're informational only
+    if all_cleared:
+        _mark_node_avoidable(conn, node_rc)
+
     outcome = "cleared" if all_cleared else "failed"
     history = [{
         "node": node_rc,
@@ -592,7 +603,7 @@ def get_longest_chains(n: int, layer: int, top_k: int = 20):
         with open(path) as f:
             try:
                 data = json.load(f)
-            except Exception:
+            except (json.JSONDecodeError, ValueError):
                 continue
         rc = data.get("start_rc", "")
         proven = data.get("proven_avoidable", False)

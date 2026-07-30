@@ -61,3 +61,65 @@ for very large games, we can't conclude that it will get all the way into one of
 If we have that, then we can be sure that there is no winning strategy.
 
 Moreover, we can actually relax the condition that the terminal node is [0,0,0]. As long as the node is [0,x,x] we know that the player whose turn it is at the terminal node doesn't have a winning strategy.
+
+
+-----
+
+7-29-26
+
+We've changed our argument to be much more precise. Before, we were considering all bad nodes at once per layer, but really we should just focus on a single node at a time (and then loop through all nodes in a layer)
+
+
+The idea is as follows:
+	We define a node N to be *avoidable* if for all GP in Grandparents(N) one of the following is true:
+		1. there exists a grandchild whose winning tuple is [0,x,x] or
+		2. every parent of GP is itself avoidable.
+		
+First we make a straightforward observation:
+
+Lemma: A node GP has a grandchild GC whose winning tuple is winner_GC = [0,x,x] if and only if the node itself has winning tuple winner_GP = [x,x,0].
+
+Proof: This follows directly from how our winning tuples are defined. There exists a pair of moves that will result in the current player having no winning strategy, therefore, at the present node, the next next player has no guarantee of a win.
+		
+Remark: The goal is to avoid nodes where a single player has a winning strategy, i.e. winner_N = [1,x,x]. We can have two players collude to avoid such a node N if N is avoidable. Suppose Players A and B are trying to make Player C lose. If Player C is at node N, this is a problem. By moving back two layers and seeing if there is a different path that will result in a winner tuple of [0,x,x] we are checking to see if A and B can "take back" their moves that and instead move towards a game-state where the current player, who is now Player C, will be losing.
+
+Moreover, the recursive nature of the definition is what will allow us to look back further than 2 moves in order to determine if a node is avoidable. Consider the following example.
+
+Example: A node N in layer k has the property that all grandparents in layer k+2 have a grandchild with winning tuple [0,x,x] except a single node, call this node badGP in Grandparents(N). Notice that by our previous lemma winner_badGP = [x,x,1]. Then, hypothetically, if Player C was able to make a move that gives Player A the position described at node badGP, then no matter what two moves Player A and Player B make, every grandchild of node GP has winning tuple [1,x,x]. Hence, Player C is left with a winning move at layer k.
+
+Players A and B must therefore avoid a situation where Player C (in layer k+3) can make a move resulting in badGP. Therefore, consider the set of parents Parents(badGP). These all have winning strategy [1,x,x]. If, for every P in Parents(badGP) and every GP^1 in Grandparents(P), there exists a grandchild GC^1 in Grandchildren(GP^1) such that winner_GC^1 = [0,x,x], then Players A and B could have always navigated to one of these grandchildren instead of the node P. Hence, Player C would never by able to make a move that gave Player A the position in node badGP.
+
+Of course, there is no reason why all of the GP^1 in Grandparents(P) should have winner_GP^1 = [x,x,0]. But, if all GP^1 in Grandparents(P) with winner_GP^1 = [x,x,1] are nodes that are themselves avoidable, we can still classify P as avoidable. Hence, N is avoidable.
+
+DRAW A DIAGRAM HERE TO HELP
+
+This illustrates how it may take many "generations" of this cycle to ultimately classify a node as avoidable. This prompts us to define a more refined version of avoidable.
+
+Def: Let $m$ be a non-negative integer. We define a node N to be *$m$-avoidable* if, for all GP in Grandparents(N), 
+	1. winner_GP = [x, x, 0], or
+	2. we need to iterate this process of checking if every parent of GP is avoidable at most m times. (THIS NEEDS WORK IN TERMS OF PHRASING)
+
+That is, it takes $m$ cycles of generation expanding in order to classify N as avoidable. In the example above, we saw a node N that was 1-avoidable. In theory, we may encounter an infinitely long chain of nodes so that we can never classify N as avoidable. Consider the following example.
+
+Example: Let N = ( |8). Since there are only inevitable moves left, we see that winner_N = [1,1,0] by a parity argument. (If it is Player C's turn at node N, then since 8 \cong 2 (mod 3), it is guaranteed that Player B will play the last inevitable move, and hence Players A and C will win.) If Players A and B would like to prevent Player C from winning, then they must avoid Player C having their turn at position N, i.e. they need to prove node N is avoidable. So, we look at the set Grandparents(N). However, notice that GP = ( |10) is in Grandparents(N), and by a parity argument winner_GP = [0,1,1]. Thus, we must hope that in fact all parents P in Parents(GP) are themselves avoidable. However, notice that ( |11) is in Parents(GP) and winner_( |11) = [1,1,0]. We have encountered a loop, and if we continue back looking at the previous nodes that occur by always adding additional inevitable moves, there is no way to escape this cycle of N -> GP -> P -> GP -> P.
+
+In order to avoid this looping, we make the following important observation.
+
+Proposition: Let N and N' be nodes such that rc(N) \cong rc(N') modulo 3. Then winner_N = winner_N' and N is avoidable if and only if N' is avoidable.
+
+Proof: The game trees prior to these points are identical when reduced modulo 3, so one is avoidable if and only if the other is. What about the game trees after? Well, the inevitable moves must be played out eventually, and it doesn't matter which player plays the moves, and hence they have the same winning strategy. (I still feel a bit uneasy about this part, especially with examples like (g_1 g_2 g_3 | 0) == (g_1 g_2 g_3 | 3 or 6 or 9).)
+
+This lets us ignore examples like the previous, where we get stuck looking at equivalent nodes modulo 3, since we only need to analyze nodes that have not yet appeared in our branching process.
+
+Our proof will hinge on the fact that in general these infinite chains do not arise when we impose a few general rules of play for Players A and B to utilize.
+
+(INSERT SECTION - parity of remaining moves play for situations where board is big enough)
+
+Strategy I:
+
+
+
+Now we begin to outline how we will recursively search the tree to determine if a node is avoidable.
+
+
+
