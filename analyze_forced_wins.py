@@ -640,3 +640,163 @@ def get_longest_chains(n: int, layer: int, top_k: int = 20):
         conn.close()
 
     return results
+
+
+# The following checks which reduced canonicals differ in their parent sets across layers
+# It seems like it's only the ones where the reduced canonical does not "reduce" any move numbers
+def check_parents_layer_independent(n: int, check_layer: int, compare_layers: range = None, sample_size: int = 50, show: bool = False):
+    """
+    For a sample of reduced canonicals that appear in check_layer AND in
+    compare_layers, checks whether the set of parent reduced canonicals is
+    the same across all those layers.
+
+    Ignores layer n (the top layer) since no parents are computed there.
+
+    Args:
+        n:              game size
+        check_layer:    the primary layer to check
+        compare_layers: range of layers to compare against, e.g. range(10, 16)
+                        defaults to all other layers below n
+        sample_size:    max number of nodes to check
+        show:           if True, print all results; if False, only print
+                        violations where total moves != layer
+    """
+    db_path = os.path.join(os.getcwd(), f"reduced_gamestates_n{n}.db")
+    conn = sqlite3.connect(db_path)
+
+    try:
+        compare_list = []
+        if compare_layers is None:
+            layer_filter = f"g2.layer != {check_layer} AND g2.layer < {n}"
+            layer_desc = f"all layers except {check_layer} and {n}"
+        else:
+            compare_list = [l for l in compare_layers if l != check_layer and l < n]
+            if not compare_list:
+                print("No valid comparison layers.")
+                return []
+            placeholders = ','.join('?' * len(compare_list))
+            layer_filter = f"g2.layer IN ({placeholders})"
+            layer_desc = f"layers {min(compare_list)}–{max(compare_list)}"
+
+        print(f"Checking layer {check_layer} vs {layer_desc}...")
+
+        if compare_layers is None:
+            rows = conn.execute(f"""
+                SELECT g1.reduced_canonical, COUNT(DISTINCT g2.layer) as layer_count
+                FROM gamestates g1
+                JOIN gamestates g2 ON g2.reduced_canonical = g1.reduced_canonical
+                                   AND {layer_filter}
+                WHERE g1.layer = ?
+                GROUP BY g1.reduced_canonical
+                LIMIT ?
+            """, (check_layer, sample_size)).fetchall()
+        else:
+            rows = conn.execute(f"""
+                SELECT g1.reduced_canonical, COUNT(DISTINCT g2.layer) as layer_count
+                FROM gamestates g1
+                JOIN gamestates g2 ON g2.reduced_canonical = g1.reduced_canonical
+                                   AND {layer_filter}
+                WHERE g1.layer = ?
+                GROUP BY g1.reduced_canonical
+                LIMIT ?
+            """, (*compare_list, check_layer, sample_size)).fetchall()
+
+        print(f"Found {len(rows)} reduced canonicals in layer {check_layer} "
+              f"that also appear in {layer_desc}...")
+
+        if compare_layers is None:
+            instance_filter = f"layer < {n}"
+            instance_params = lambda rc: (rc, n)
+        else:
+            all_layers = sorted(set([check_layer] + compare_list))
+            placeholders = ','.join('?' * len(all_layers))
+            instance_filter = f"layer IN ({placeholders})"
+            instance_params = lambda rc: (rc, *all_layers)
+
+        violations = []
+        for (rc, layer_count) in rows:
+            instances = conn.execute(f"""
+                SELECT layer, turn FROM gamestates
+                WHERE reduced_canonical = ? AND {instance_filter}
+                ORDER BY layer
+            """, instance_params(rc)).fetchall()
+
+            parent_sets = {}
+            for layer, turn in instances:
+                parents = conn.execute("""
+                    SELECT DISTINCT e.parent_reduced
+                    FROM edges e
+                    WHERE e.child_reduced = ?
+                      AND e.child_layer = ?
+                      AND e.child_turn = ?
+                """, (rc, layer, turn)).fetchall()
+                parent_sets[(layer, turn)] = frozenset(r[0] for r in parents)
+
+            # Compute layer vs gap+inevitable with extra +1 if odd # of negative gaps for each instance
+            def compute_total(rc, layer):
+                gaps_str, inev_str = rc.split('|')
+                inevitable = int(inev_str)
+                live_gap_total = 0
+                num_negs = 0
+                if gaps_str:
+                    for g in gaps_str.split(','):
+                        orientation = 1 if g[0] == '+' else -1
+                        size = int(g[1:])
+                        live_gap_total += size
+                        if orientation == -1:
+                            num_negs += 1
+                total = live_gap_total + inevitable + (1 if num_negs % 2 != 0 else 0)
+                return total, live_gap_total, inevitable, num_negs
+
+            # Check if any instance has total != layer
+            layer_mismatches = []
+            for (layer, turn), pset in sorted(parent_sets.items()):
+                if layer != check_layer:
+                    continue
+                total, live_gap_total, inevitable, num_negs = compute_total(rc, layer)
+                if total != layer:
+                    layer_mismatches.append((layer, turn, total, live_gap_total, inevitable))
+
+            unique_sets = set(parent_sets.values())
+            has_parent_violation = len(unique_sets) > 1
+            has_layer_mismatch = len(layer_mismatches) > 0
+
+            # Decide whether to print this node
+            if show or has_layer_mismatch:
+                if has_parent_violation:
+                    print(f"\n  VIOLATION: {rc} (appears in {len(instances)} layers)")
+                    for (layer, turn), pset in sorted(parent_sets.items()):
+                        print(f"    Layer {layer}, turn {turn} ({len(pset)} parents): {sorted(pset)}")
+
+                    print(f"    Differences:")
+                    items = sorted(parent_sets.items())
+                    for i in range(len(items)):
+                        for j in range(i+1, len(items)):
+                            (l1, t1), s1 = items[i]
+                            (l2, t2), s2 = items[j]
+                            only_in_1 = sorted(s1 - s2)
+                            only_in_2 = sorted(s2 - s1)
+                            if only_in_1 or only_in_2:
+                                print(f"      Layer {l1} vs Layer {l2}:")
+                                if only_in_1:
+                                    print(f"        Only in L{l1}: {only_in_1}")
+                                if only_in_2:
+                                    print(f"        Only in L{l2}: {only_in_2}")
+                else:
+                    if show:
+                        print(f"  OK: {rc} — same {len(next(iter(unique_sets)))} parents across {len(instances)} layers")
+
+            if has_parent_violation:
+                violations.append({
+                    "rc": rc,
+                    "layer_count": len(instances),
+                    "parent_sets": {str(k): sorted(v) for k, v in parent_sets.items()}, #(layer, turn): parents set
+                    "layer_mismatches": layer_mismatches,
+                })
+
+        print(f"\n{'='*50}")
+        print(f"Parent set violations: {len(violations)} / {len(rows)}")
+        return violations
+
+    finally:
+        conn.close()

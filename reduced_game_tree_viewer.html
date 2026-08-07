@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Reduced Game Tree Viewer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #1a1a1a; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+
+  #toolbar { display: flex; align-items: center; gap: 10px; padding: 8px 12px; background: #242424; border-bottom: 1px solid #333; flex-wrap: wrap; flex-shrink: 0; }
+  #toolbar h1 { font-size: 14px; font-weight: 600; color: #aaa; white-space: nowrap; }
+  .tb-group { display: flex; align-items: center; gap: 6px; }
+  .tb-label { font-size: 12px; color: #888; white-space: nowrap; }
+  input[type=range] { width: 120px; }
+  input[type=text] { background: #333; border: 1px solid #444; color: #e0e0e0; padding: 3px 7px; border-radius: 4px; font-size: 12px; width: 180px; }
+  button { background: #333; border: 1px solid #444; color: #ddd; padding: 3px 10px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+  button:hover { background: #444; }
+  button.active { background: #378ADD; border-color: #378ADD; color: #fff; }
+  #status { font-size: 11px; color: #666; margin-left: auto; white-space: nowrap; }
+
+  #main { display: flex; flex: 1; overflow: hidden; }
+
+  #canvas-wrap { flex: 1; overflow: hidden; position: relative; }
+  svg { width: 100%; height: 100%; cursor: grab; }
+  svg.grabbing { cursor: grabbing; }
+
+  .node rect { stroke-width: 1; rx: 4; }
+  .node text { font-size: 11px; pointer-events: none; }
+  .node.selected rect { stroke-width: 2.5; }
+  .node.dimmed { opacity: 0.15; }
+  .link { fill: none; stroke-width: 0.8; }
+  .link.dimmed { opacity: 0.05; }
+
+  #sidebar { width: 260px; background: #1e1e1e; border-left: 1px solid #333; overflow-y: auto; flex-shrink: 0; display: flex; flex-direction: column; }
+  #sidebar h2 { font-size: 12px; font-weight: 600; color: #888; padding: 10px 12px 6px; border-bottom: 1px solid #2a2a2a; }
+  .detail-block { padding: 10px 12px; border-bottom: 1px solid #2a2a2a; }
+  .detail-block h3 { font-size: 11px; color: #666; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .detail-row { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 3px; }
+  .detail-row .label { color: #777; }
+  .detail-row .value { color: #e0e0e0; font-family: monospace; }
+  .winner-badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; font-family: monospace; }
+  .neighbor-list { list-style: none; }
+  .neighbor-item { font-size: 11px; font-family: monospace; padding: 3px 0; cursor: pointer; color: #aaa; border-bottom: 1px solid #2a2a2a; }
+  .neighbor-item:hover { color: #378ADD; }
+  .neighbor-item .n-winner { float: right; color: #666; }
+
+  #legend { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  .leg { display: flex; align-items: center; gap: 4px; font-size: 11px; color: #888; }
+  .leg-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+
+  #search-results { position: absolute; top: 36px; left: 0; background: #2a2a2a; border: 1px solid #444; border-radius: 4px; width: 100%; max-height: 200px; overflow-y: auto; z-index: 10; display: none; }
+  .sr-item { padding: 5px 8px; font-size: 12px; font-family: monospace; cursor: pointer; border-bottom: 1px solid #333; }
+  .sr-item:hover { background: #333; }
+  .sr-item .sr-meta { color: #666; font-size: 10px; }
+  #search-wrap { position: relative; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <h1>Reduced Game Tree</h1>
+
+  <div class="tb-group">
+    <span class="tb-label">Layer range:</span>
+    <span class="tb-label" id="layer-min-label">—</span>
+    <input type="range" id="slider-min" min="0" max="100" value="0">
+    <span>–</span>
+    <input type="range" id="slider-max" min="0" max="100" value="10">
+    <span class="tb-label" id="layer-max-label">—</span>
+    <button onclick="loadNodes()">Load</button>
+	<button onclick="resetView()">Reset view</button>
+  </div>
+
+  <div class="tb-group" id="search-wrap">
+    <input type="text" id="search-input" placeholder="Search reduced canonical..." oninput="onSearch()">
+    <div id="search-results"></div>
+  </div>
+
+  <div id="legend">
+    <div class="leg"><div class="leg-dot" style="background:#378ADD"></div>P1 wins</div>
+    <div class="leg"><div class="leg-dot" style="background:#1D9E75"></div>P1 loses</div>
+    <div class="leg"><div class="leg-dot" style="background:#888"></div>Unknown</div>
+    <div class="leg"><div class="leg-dot" style="background:#F5A623; border: 2px solid #fff"></div>Avoidable</div>
+  </div>
+
+  <span id="status">Not connected</span>
+</div>
+
+<div id="main">
+  <div id="canvas-wrap">
+    <svg id="svg">
+      <defs>
+        <marker id="arrow" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
+          <path d="M0,0 L0,6 L6,3 z" fill="#555"/>
+        </marker>
+      </defs>
+      <g id="root">
+        <g id="links-g"></g>
+        <g id="nodes-g"></g>
+      </g>
+    </svg>
+  </div>
+
+  <div id="sidebar">
+    <h2>Node Inspector</h2>
+    <div id="detail-content">
+      <div class="detail-block" style="color:#555; font-size:12px; padding:16px 12px;">
+        Click a node to inspect it.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = 'http://localhost:5000';
+let allNodes = [], allEdges = [];
+let selectedNode = null;
+let highlightSet = null;
+
+// ── D3 setup ──────────────────────────────────────────────────────────────────
+const svg = d3.select('#svg');
+const root = svg.select('#root');
+const linksG = root.select('#links-g');
+const nodesG = root.select('#nodes-g');
+
+const zoom = d3.zoom()
+  .scaleExtent([0.05, 5])
+  .on('zoom', e => root.attr('transform', e.transform));
+svg.call(zoom);
+svg.on('mousedown', () => svg.node().classList.add('grabbing'));
+window.addEventListener('mouseup', () => svg.node().classList.remove('grabbing'));
+
+// ── Colors ────────────────────────────────────────────────────────────────────
+function nodeColor(d) {
+  if (!d.winner) return '#666';
+  return d.winner[0] === 1 ? '#378ADD' : '#1D9E75';
+}
+function nodeBorderColor(d) {
+  if (d.avoidable === 1) return '#F5A623';
+  return nodeColor(d);
+}
+function winnerStr(w) {
+  if (!w) return '?';
+  return `[${w.join(',')}]`;
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+async function init() {
+  try {
+    const info = await fetch(`${API}/info`).then(r => r.json());
+    document.title = `Reduced Game Tree n=${info.n}`;
+    document.querySelector('#toolbar h1').textContent = `Reduced Game Tree  n=${info.n}`;
+
+    const sliderMin = document.getElementById('slider-min');
+    const sliderMax = document.getElementById('slider-max');
+    sliderMin.min = info.min_layer;
+    sliderMin.max = info.max_layer;
+    sliderMax.min = info.min_layer;
+    sliderMax.max = info.max_layer;
+
+    // Default: show top 5 layers
+    sliderMin.value = Math.max(info.min_layer, info.max_layer - 5);
+    sliderMax.value = info.max_layer;
+    updateSliderLabels();
+
+    document.getElementById('status').textContent =
+      `n=${info.n} • ${info.total_nodes.toLocaleString()} total nodes • layers ${info.min_layer}–${info.max_layer}`;
+
+    loadNodes();
+  } catch(e) {
+    document.getElementById('status').textContent = `⚠ Cannot connect to server at ${API}`;
+  }
+}
+
+function updateSliderLabels() {
+  const mn = document.getElementById('slider-min').value;
+  const mx = document.getElementById('slider-max').value;
+  document.getElementById('layer-min-label').textContent = mn;
+  document.getElementById('layer-max-label').textContent = mx;
+}
+document.getElementById('slider-min').addEventListener('input', () => {
+  const mn = +document.getElementById('slider-min').value;
+  const mx = +document.getElementById('slider-max').value;
+  if (mn > mx) document.getElementById('slider-max').value = mn;
+  updateSliderLabels();
+});
+document.getElementById('slider-max').addEventListener('input', () => {
+  const mn = +document.getElementById('slider-min').value;
+  const mx = +document.getElementById('slider-max').value;
+  if (mx < mn) document.getElementById('slider-min').value = mx;
+  updateSliderLabels();
+});
+
+// ── Load nodes ────────────────────────────────────────────────────────────────
+async function loadNodes() {
+  const layerMin = +document.getElementById('slider-min').value;
+  const layerMax = +document.getElementById('slider-max').value;
+  document.getElementById('status').textContent = 'Loading...';
+
+  try {
+    const data = await fetch(`${API}/nodes?layer_min=${layerMin}&layer_max=${layerMax}`).then(r => r.json());
+    allNodes = data.nodes;
+    allEdges = data.edges;
+    selectedNode = null;
+    highlightSet = null;
+    render();
+    document.getElementById('status').textContent =
+      `Showing layers ${layerMin}–${layerMax} • ${allNodes.length.toLocaleString()} nodes • ${allEdges.length.toLocaleString()} edges`;
+  } catch(e) {
+    document.getElementById('status').textContent = `Error: ${e.message}`;
+  }
+}
+
+// ── Layout ────────────────────────────────────────────────────────────────────
+const NODE_W = 160, NODE_H = 28, COL_GAP = 220, ROW_GAP = 36;
+
+function layout(nodes) {
+  // Group by layer, sort each column
+  const byLayer = d3.group(nodes, d => d.layer);
+  const layers = Array.from(byLayer.keys()).sort((a,b) => b - a); // highest layer left
+
+  nodes.forEach(n => {
+    const layerIdx = layers.indexOf(n.layer);
+    const group = byLayer.get(n.layer);
+    const rowIdx = group.indexOf(n);
+    n.x = layerIdx * COL_GAP;
+    n.y = rowIdx * ROW_GAP;
+  });
+}
+
+// ── Render ────────────────────────────────────────────────────────────────────
+function render() {
+  layout(allNodes);
+
+  const nodeById = new Map(allNodes.map(n => [n.id, n]));
+
+  // Links
+  const links = linksG.selectAll('.link')
+    .data(allEdges, d => d.source + '->' + d.target);
+
+  links.enter().append('path').attr('class', 'link')
+    .merge(links)
+    .attr('stroke', d => {
+      const t = nodeById.get(d.target);
+      return t ? nodeColor(t) + '55' : '#55555555';
+    })
+    .attr('d', d => {
+      const s = nodeById.get(d.source), t = nodeById.get(d.target);
+      if (!s || !t) return '';
+      const x1 = s.x + NODE_W, y1 = s.y + NODE_H/2;
+      const x2 = t.x, y2 = t.y + NODE_H/2;
+      const mx = (x1 + x2) / 2;
+      return `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
+    })
+    .classed('dimmed', d => highlightSet && (!highlightSet.has(d.source) || !highlightSet.has(d.target)));
+
+  links.exit().remove();
+
+  // Nodes
+  const nodeG = nodesG.selectAll('.node')
+    .data(allNodes, d => d.id);
+
+  const enter = nodeG.enter().append('g').attr('class', 'node')
+    .on('click', (e, d) => selectNode(d))
+    .call(d3.drag()
+      .on('start', (e, d) => { d.dragging = true; })
+      .on('drag', (e, d) => { d.x += e.dx; d.y += e.dy; renderPositions(); })
+      .on('end', (e, d) => { d.dragging = false; })
+    );
+
+  enter.append('rect').attr('width', NODE_W).attr('height', NODE_H).attr('rx', 4);
+  enter.append('text').attr('class', 'rc-label').attr('x', 7).attr('y', 12).attr('dominant-baseline', 'middle');
+  enter.append('text').attr('class', 'sub-label').attr('x', 7).attr('y', 23).attr('dominant-baseline', 'middle').style('font-size', '9px');
+
+  const merged = enter.merge(nodeG);
+
+  merged.select('rect')
+    .attr('fill', d => nodeColor(d) + '20')
+    .attr('stroke', d => nodeBorderColor(d))
+    .attr('stroke-width', d => d.avoidable === 1 ? 2 : (selectedNode?.id === d.id ? 2.5 : 0.8));
+
+  merged.select('.rc-label')
+    .text(d => d.rc.length > 22 ? d.rc.slice(0, 20) + '…' : d.rc)
+    .attr('fill', d => nodeColor(d));
+
+  merged.select('.sub-label')
+    .text(d => `L${d.layer} T${d.turn}  ${winnerStr(d.winner)}`)
+    .attr('fill', d => nodeColor(d) + 'aa');
+
+  merged.classed('selected', d => selectedNode?.id === d.id)
+    .classed('dimmed', d => highlightSet && !highlightSet.has(d.id));
+
+  nodeG.exit().remove();
+  renderPositions();
+}
+
+function renderPositions() {
+  nodesG.selectAll('.node').attr('transform', d => `translate(${d.x},${d.y})`);
+  linksG.selectAll('.link').attr('d', d => {
+    const nodeById = new Map(allNodes.map(n => [n.id, n]));
+    const s = nodeById.get(d.source), t = nodeById.get(d.target);
+    if (!s || !t) return '';
+    const x1=s.x+NODE_W, y1=s.y+NODE_H/2, x2=t.x, y2=t.y+NODE_H/2, mx=(x1+x2)/2;
+    return `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
+  });
+}
+
+// ── Selection & highlight ─────────────────────────────────────────────────────
+function selectNode(d) {
+  if (selectedNode?.id === d.id) {
+    selectedNode = null; highlightSet = null;
+  } else {
+    selectedNode = d;
+    // Highlight ancestors + descendants in loaded set
+    const edgesBySource = d3.group(allEdges, e => e.source);
+    const edgesByTarget = d3.group(allEdges, e => e.target);
+    const hl = new Set();
+    function desc(id) { hl.add(id); for (const e of edgesBySource.get(id)||[]) if (!hl.has(e.target)) desc(e.target); }
+    function anc(id) { hl.add(id); for (const e of edgesByTarget.get(id)||[]) if (!hl.has(e.source)) anc(e.source); }
+    desc(d.id); anc(d.id);
+    highlightSet = hl;
+    loadDetail(d);
+  }
+  render();
+}
+
+async function loadDetail(d) {
+  const detail = document.getElementById('detail-content');
+  detail.innerHTML = '<div class="detail-block" style="color:#555;font-size:12px;padding:12px;">Loading...</div>';
+
+  try {
+    const data = await fetch(`${API}/node?rc=${encodeURIComponent(d.rc)}&layer=${d.layer}&turn=${d.turn}`).then(r => r.json());
+    const n = data.node;
+    const w = n.winner;
+
+    const wColor = w ? (w[0]===1?'#378ADD':'#1D9E75') : '#888';
+    const avBadge = data.avoidable === 1
+      ? '<span style="color:#F5A623;font-size:11px">✓ avoidable</span>'
+      : (data.avoidable === null ? '' : `<span style="color:#888;font-size:11px">depth ${Math.abs(data.avoidable)}</span>`);
+
+    detail.innerHTML = `
+      <div class="detail-block">
+        <h3>Node</h3>
+        <div class="detail-row"><span class="label">Canonical</span><span class="value" style="font-size:11px">${n.rc}</span></div>
+        <div class="detail-row"><span class="label">Layer</span><span class="value">${n.layer}</span></div>
+        <div class="detail-row"><span class="label">Turn</span><span class="value">Player ${n.turn+1}</span></div>
+        <div class="detail-row"><span class="label">Winner</span>
+          <span class="winner-badge" style="background:${wColor}22;color:${wColor}">${w?`[${w.join(',')}]`:'?'}</span></div>
+        <div class="detail-row"><span class="label">Avoidable</span><span class="value">${avBadge||'—'}</span></div>
+      </div>
+      <div class="detail-block">
+        <h3>Parents (${data.parents.length})</h3>
+        <ul class="neighbor-list">
+          ${data.parents.slice(0,20).map(p => `
+            <li class="neighbor-item" onclick="jumpTo('${p.rc}',${p.layer},${p.turn})">
+              ${p.rc.length>22?p.rc.slice(0,20)+'…':p.rc}
+              <span class="n-winner">${p.winner?`[${p.winner.join(',')}]`:'?'} L${p.layer}</span>
+            </li>`).join('')}
+          ${data.parents.length>20?`<li class="neighbor-item" style="color:#555">…+${data.parents.length-20} more</li>`:''}
+        </ul>
+      </div>
+      <div class="detail-block">
+        <h3>Children (${data.children.length})</h3>
+        <ul class="neighbor-list">
+          ${data.children.slice(0,20).map(c => `
+            <li class="neighbor-item" onclick="jumpTo('${c.rc}',${c.layer},${c.turn})">
+              ${c.rc.length>22?c.rc.slice(0,20)+'…':c.rc}
+              <span class="n-winner">${c.winner?`[${c.winner.join(',')}]`:'?'} L${c.layer}</span>
+            </li>`).join('')}
+          ${data.children.length>20?`<li class="neighbor-item" style="color:#555">…+${data.children.length-20} more</li>`:''}
+        </ul>
+      </div>
+    `;
+  } catch(e) {
+    detail.innerHTML = `<div class="detail-block" style="color:#e44;font-size:12px;padding:12px;">Error: ${e.message}</div>`;
+  }
+}
+
+function jumpTo(rc, layer, turn) {
+  // Adjust sliders to include this layer and reload
+  const sliderMin = document.getElementById('slider-min');
+  const sliderMax = document.getElementById('slider-max');
+  const curMin = +sliderMin.value, curMax = +sliderMax.value;
+  if (layer < curMin) sliderMin.value = layer;
+  if (layer > curMax) sliderMax.value = layer;
+  updateSliderLabels();
+  loadNodes().then(() => {
+    const target = allNodes.find(n => n.rc===rc && n.layer===layer && n.turn===turn);
+    if (target) selectNode(target);
+  });
+}
+
+// ── Search ────────────────────────────────────────────────────────────────────
+let searchTimeout = null;
+function onSearch() {
+  clearTimeout(searchTimeout);
+  searchTimeout = setTimeout(doSearch, 300);
+}
+
+async function doSearch() {
+  const q = document.getElementById('search-input').value.trim();
+  const box = document.getElementById('search-results');
+  if (!q) { box.style.display='none'; return; }
+  try {
+    const results = await fetch(`${API}/search?q=${encodeURIComponent(q)}`).then(r => r.json());
+    if (!results.length) { box.style.display='none'; return; }
+    box.innerHTML = results.map(r => `
+      <div class="sr-item" onclick="jumpTo('${r.rc}',${r.layer},${r.turn});document.getElementById('search-results').style.display='none'">
+        <span>${r.rc}</span>
+        <span class="sr-meta"> L${r.layer} T${r.turn} ${r.winner?`[${r.winner.join(',')}]`:'?'}</span>
+      </div>`).join('');
+    box.style.display = 'block';
+  } catch(e) {}
+}
+document.addEventListener('click', e => {
+  if (!e.target.closest('#search-wrap')) document.getElementById('search-results').style.display='none';
+});
+
+init();
+
+function resetView() {
+    svg.transition().duration(400).call(
+        zoom.transform,
+        d3.zoomIdentity.translate(40, 40).scale(1)
+    );
+}
+</script>
+</body>
+</html>
