@@ -55,64 +55,6 @@ def _create_temp_table_with_mod3(conn, name, canonicals_with_layers):
     ])
 
 
-def filter_avoidable_nodes(conn, target: list, k: int):
-    """
-    Given a list of (reduced_canonical, layer) tuples at layer k, find all
-    grandparents (layer k+2) and classify them by winner[2].
-    Uses tight layer constraints (k+1, k+2) for fast index lookups.
-
-    Can escape:  grandparent.winner[2] = 0  (has a grandchild with winner[0]=0)
-    Cant escape: grandparent.winner[2] = 1  (all grandchildren have winner[0]=1)
-
-    Returns (can_escape, cant_escape, found_any) lists of (reduced_canonical, layer) tuples.
-    found_any=False means no grandparents were found at all (computational limit reached).
-    """
-    _create_temp_table(conn, "tmp_target", target,
-                       columns="reduced_canonical TEXT, layer INTEGER",
-                       pk="reduced_canonical, layer")
-
-    cur = conn.execute("""
-        SELECT DISTINCT
-            g.reduced_canonical,
-            g.layer,
-            json_extract(g.winner, '$[2]') AS prev
-        FROM edges e1
-        JOIN edges e2      ON e2.parent_reduced = e1.child_reduced
-                           AND e2.parent_layer = e1.child_layer
-                           AND e2.parent_turn = e1.child_turn
-        JOIN tmp_target t  ON t.reduced_canonical = e2.child_reduced
-                           AND t.layer = e2.child_layer
-        JOIN gamestates g  ON g.reduced_canonical = e1.parent_reduced
-                           AND g.layer = e1.parent_layer
-                           AND g.turn = e1.parent_turn
-        WHERE e2.child_layer = ?
-          AND e2.parent_layer = ?
-          AND e1.child_layer = ?
-          AND e1.parent_layer = ?
-          AND g.winner IS NOT NULL
-    """, (k, k + 1, k + 1, k + 2))
-    rows = cur.fetchall()
-
-    if not rows:
-        print(f"  No grandparents found for {len(target):,} target nodes — computational limit reached.")
-        return [], [], False
-
-    print(f"  Found {len(rows):,} distinct grandparents at layer {k+2}")
-
-    can_escape = []
-    cant_escape = []
-    for rc, layer, prev in rows:
-        if prev == 1:
-            cant_escape.append((rc, layer))
-        else:
-            can_escape.append((rc, layer))
-
-    print(f"  Can escape  (winner[2]=0): {len(can_escape):,}")
-    print(f"  Cant escape (winner[2]=1): {len(cant_escape):,}")
-
-    return can_escape, cant_escape, True
-
-
 def _find_parents(conn, canonicals: list, tmp_name: str):
     """
     Given a list of (reduced_canonical, layer) tuples, find all distinct
@@ -220,129 +162,6 @@ def _mark_node_avoidable(conn, rc: str):
     """, (reduced_canonical_mod3(rc),))
 
 
-def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds, current_round, live_moves_fn):
-    """
-    Recursively propagate a single node until it's cleared or max_rounds is reached.
-    Returns (cleared, history) where history is a list of round dicts.
-    Mod3-identical nodes are kept in history as leaves but not recursed into.
-    Any node that clears is immediately marked avoidable in the DB.
-    """
-    if current_round > max_rounds:
-        return False, []
-
-    node_rc_mod3 = reduced_canonical_mod3(node_rc)
-    print(f"  {'  ' * (current_round - 1)}[Round {current_round}] Analyzing {node_rc} at layer {node_layer}")
-
-    can_escape, cant_escape, found_any = filter_avoidable_nodes(
-        conn, [(node_rc, node_layer)], node_layer
-    )
-
-    if not found_any:
-        return False, [{"node": node_rc, "round": current_round, "outcome": "computational limit"}]
-
-    if not cant_escape:
-        _mark_node_avoidable(conn, node_rc)
-        return True, [{"node": node_rc, "round": current_round, "outcome": "cleared - all grandparents escape"}]
-
-    cant_escape = dedup_by_inevitable_mod3(cant_escape)
-
-    _create_temp_table_with_mod3(conn, "tmp_cant_escape_check", cant_escape)
-
-    cant_escape = conn.execute("""
-        SELECT DISTINCT t.reduced_canonical, t.layer
-        FROM tmp_cant_escape_check t
-        WHERE NOT EXISTS (
-            SELECT 1 FROM avoidable_mod3 a
-            WHERE a.reduced_canonical_mod3 = t.reduced_canonical_mod3
-        )
-    """).fetchall()
-
-    if not cant_escape:
-        _mark_node_avoidable(conn, node_rc)
-        return True, [{"node": node_rc, "round": current_round, "outcome": "cleared - all cant-escape already avoidable"}]
-
-    cant_escape_layer = node_layer + 2
-
-    new_nodes = conn.execute("""
-        SELECT DISTINCT e.parent_reduced, e.parent_layer
-        FROM edges e
-        JOIN tmp_cant_escape_check t ON t.reduced_canonical = e.child_reduced
-                                     AND t.layer = e.child_layer
-        WHERE e.child_layer = ?
-          AND e.parent_layer = ?
-    """, (cant_escape_layer, cant_escape_layer + 1)).fetchall()
-
-    new_nodes = filter_new_target(new_nodes)
-    new_nodes = dedup_by_inevitable_mod3(new_nodes)
-
-    # Separate loop nodes (mod3-identical) — keep in history but don't recurse
-    loop_nodes = [
-        (rc, layer) for rc, layer in new_nodes
-        if reduced_canonical_mod3(rc) == node_rc_mod3
-        or reduced_canonical_mod3(rc) == origin_rc_mod3
-    ]
-    new_nodes = [
-        (rc, layer) for rc, layer in new_nodes
-        if (rc, layer) not in set(loop_nodes)
-    ]
-
-    if not new_nodes:
-        # Either everything was filtered out, or only loop nodes remain.
-        # Loop nodes are excluded from propagation by design, so the node clears.
-        _mark_node_avoidable(conn, node_rc)
-        outcome = "cleared - new target empty after filtering" if not loop_nodes else "cleared - only loop nodes remain"
-        return True, [{"node": node_rc, "round": current_round, "outcome": outcome,
-                       "children": [{"child": rc, "cleared": False,
-                                     "history": [{"node": rc, "round": current_round + 1,
-                                                  "outcome": "loop - mod3 identical to origin"}]}
-                                    for rc, _ in loop_nodes]}]
-
-    # Sort by live_moves descending
-    new_nodes = sorted(new_nodes, key=lambda x: live_moves_fn(x[0]), reverse=True)
-
-    # Build children — loop nodes as leaves, others recursed
-    children = []
-
-    for child_rc, child_layer in loop_nodes:
-        children.append({
-            "child": child_rc,
-            "cleared": False,
-            "history": [{
-                "node": child_rc,
-                "round": current_round + 1,
-                "outcome": "loop - mod3 identical to origin",
-            }]
-        })
-
-    all_cleared = True
-    for child_rc, child_layer in new_nodes:
-        child_cleared, child_history = _propagate_node(
-            conn, child_rc, child_layer, origin_rc_mod3,
-            max_rounds, current_round + 1, live_moves_fn
-        )
-        children.append({
-            "child": child_rc,
-            "cleared": child_cleared,
-            "history": child_history,
-        })
-        if not child_cleared:
-            all_cleared = False
-
-    if all_cleared:
-        _mark_node_avoidable(conn, node_rc)
-
-    outcome = "cleared" if all_cleared else "failed"
-    history = [{
-        "node": node_rc,
-        "round": current_round,
-        "new_nodes": [rc for rc, _ in (loop_nodes + new_nodes)],
-        "children": children,
-        "outcome": outcome,
-    }]
-
-    return all_cleared, history
-
-
 def get_layer_nodes_by_moves(n: int, layer: int) -> list:
     """
     Returns all (reduced_canonical, layer) nodes at the given layer
@@ -406,37 +225,347 @@ def _has_children(history: list) -> bool:
     return False
 
 
-def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10):
+def clear_avoidable(n: int, max_layer: int = None):
+    """
+    Clears all avoidable labels from the gamestates table and empties
+    the avoidable_mod3 table. If max_layer is specified, only clears
+    nodes at layers <= max_layer.
+    """
+    db_path = os.path.join(os.getcwd(), f"reduced_gamestates_n{n}.db")
+    conn = sqlite3.connect(db_path)
+    try:
+        if max_layer is not None:
+            conn.execute("""
+                UPDATE gamestates SET avoidable = NULL
+                WHERE layer <= ? AND avoidable IS NOT NULL
+            """, (max_layer,))
+            print(f"Cleared avoidable labels for n={n}, layers 0-{max_layer}.")
+        else:
+            conn.execute("UPDATE gamestates SET avoidable = NULL")
+            print(f"Cleared all avoidable labels for n={n}.")
+
+        conn.execute("DELETE FROM avoidable_mod3")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------------------------
+# Main Backwards Analysis
+# --------------------------------------------------------------------------------------------
+
+
+def filter_avoidable_nodes(conn, target: list, k: int, shift_cache: dict = None):
+    """
+    Given a list of (reduced_canonical, layer) tuples, find all grandparents
+    and classify them by winner[2].
+
+    Applies the shift check at each hop: if compute_total(rc)[0] == layer for a
+    node, shift it to (rc, layer+2) before looking up its parents.
+
+    shift_cache: optional dict for memoizing (rc, layer) -> shifted_layer lookups.
+
+    Returns (can_escape, cant_escape, found_any) lists of (reduced_canonical, layer).
+    found_any=False means no grandparents were found (computational limit reached).
+    """
+    if shift_cache is None:
+        shift_cache = {}
+
+    def apply_shift(nodes, label):
+        """Shift any node whose compute_total equals its layer. Cached."""
+        out = []
+        for rc, layer in nodes:
+            key = (rc, layer)
+            if key in shift_cache:
+                out.append((rc, shift_cache[key]))
+                continue
+            if compute_total(rc)[0] == layer:
+                shifted_layer = layer + 2
+                exists = conn.execute("""
+                    SELECT 1 FROM gamestates
+                    WHERE reduced_canonical = ? AND layer = ? LIMIT 1
+                """, (rc, shifted_layer)).fetchone()
+                if not exists:
+                    raise ValueError(
+                        f"Shifted {label} not found in DB: rc='{rc}' at layer {shifted_layer} "
+                        f"(original layer={layer}, compute_total={compute_total(rc)[0]})"
+                    )
+                shift_cache[key] = shifted_layer
+                out.append((rc, shifted_layer))
+            else:
+                shift_cache[key] = layer
+                out.append((rc, layer))
+        return out
+
+    def parents_of(nodes, tmp_name):
+        """
+        Find parents of nodes, grouped by layer so each query can use literal
+        layer parameters (index-friendly) rather than a computed expression.
+        """
+        by_layer = {}
+        for rc, layer in nodes:
+            by_layer.setdefault(layer, []).append((rc, layer))
+
+        found = []
+        for layer, group in by_layer.items():
+            _create_temp_table(conn, tmp_name, group,
+                               columns="reduced_canonical TEXT, layer INTEGER",
+                               pk="reduced_canonical, layer")
+            found.extend(conn.execute(f"""
+                SELECT DISTINCT e.parent_reduced, e.parent_layer
+                FROM edges e
+                JOIN {tmp_name} t ON t.reduced_canonical = e.child_reduced
+                                  AND t.layer = e.child_layer
+                WHERE e.child_layer = ?
+                  AND e.parent_layer = ?
+            """, (layer, layer + 1)).fetchall())
+        return list(set(found))
+
+    # Hop 0: shift the targets themselves
+    shifted_target = apply_shift(target, "target")
+
+    # Hop 1: targets -> parents
+    parents = parents_of(shifted_target, "tmp_target")
+    if not parents:
+        print(f"  No parents found for {len(shifted_target):,} target nodes — computational limit reached.")
+        return [], [], False
+
+    # Hop 1.5: shift the parents before going up again
+    shifted_parents = apply_shift(parents, "parent")
+
+    # Hop 2: parents -> grandparents, reading winner[2] directly
+    by_layer = {}
+    for rc, layer in shifted_parents:
+        by_layer.setdefault(layer, []).append((rc, layer))
+
+    all_rows = []
+    for layer, group in by_layer.items():
+        _create_temp_table(conn, "tmp_parents", group,
+                           columns="reduced_canonical TEXT, layer INTEGER",
+                           pk="reduced_canonical, layer")
+        all_rows.extend(conn.execute("""
+            SELECT DISTINCT
+                g.reduced_canonical,
+                g.layer,
+                json_extract(g.winner, '$[2]') AS prev
+            FROM edges e
+            JOIN tmp_parents p ON p.reduced_canonical = e.child_reduced
+                               AND p.layer = e.child_layer
+            JOIN gamestates g  ON g.reduced_canonical = e.parent_reduced
+                               AND g.layer = e.parent_layer
+                               AND g.turn = e.parent_turn
+            WHERE e.child_layer = ?
+              AND e.parent_layer = ?
+              AND g.winner IS NOT NULL
+        """, (layer, layer + 1)).fetchall())
+
+    if not all_rows:
+        print(f"  No grandparents found — computational limit reached.")
+        return [], [], False
+
+    print(f"  Found {len(all_rows):,} distinct grandparents")
+
+    can_escape, cant_escape = [], []
+    for rc, layer, prev in all_rows:
+        (cant_escape if prev == 1 else can_escape).append((rc, layer))
+
+    print(f"  Can escape  (winner[2]=0): {len(can_escape):,}")
+    print(f"  Cant escape (winner[2]=1): {len(cant_escape):,}")
+
+    return can_escape, cant_escape, True
+
+
+def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
+                    current_round, live_moves_fn, memo=None, shift_cache=None):
+    """
+    Recursively propagate a single node until it clears or max_rounds is reached.
+
+    memo: dict {(rc, layer): (cleared, history)} caching CLEARED results only.
+          Failures are not cached because avoidable_mod3 grows during the run,
+          so a node that failed early may succeed later.
+    shift_cache: dict {(rc, layer): shifted_layer} for the shift existence checks.
+    """
+    if memo is None:
+        memo = {}
+    if shift_cache is None:
+        shift_cache = {}
+
+    if current_round > max_rounds:
+        return False, []
+
+    memo_key = (node_rc, node_layer)
+    if memo_key in memo:
+        cleared, cached_history = memo[memo_key]
+        print(f"  {'  ' * (current_round - 1)}[Round {current_round}] {node_rc} @ layer {node_layer} — cached (cleared)")
+        return cleared, cached_history
+
+    node_rc_mod3 = reduced_canonical_mod3(node_rc)
+    print(f"  {'  ' * (current_round - 1)}[Round {current_round}] Analyzing {node_rc} at layer {node_layer}")
+
+    can_escape, cant_escape, found_any = filter_avoidable_nodes(
+        conn, [(node_rc, node_layer)], node_layer, shift_cache=shift_cache
+    )
+
+    if not found_any:
+        return False, [{"node": node_rc, "round": current_round, "outcome": "computational limit"}]
+
+    if not cant_escape:
+        _mark_node_avoidable(conn, node_rc)
+        hist = [{"node": node_rc, "round": current_round, "outcome": "cleared - all grandparents escape"}]
+        memo[memo_key] = (True, hist)
+        return True, hist
+
+    cant_escape = dedup_by_inevitable_mod3(cant_escape)
+
+    _create_temp_table_with_mod3(conn, "tmp_cant_escape_check", cant_escape)
+
+    cant_escape = conn.execute("""
+        SELECT DISTINCT t.reduced_canonical, t.layer
+        FROM tmp_cant_escape_check t
+        WHERE NOT EXISTS (
+            SELECT 1 FROM avoidable_mod3 a
+            WHERE a.reduced_canonical_mod3 = t.reduced_canonical_mod3
+        )
+    """).fetchall()
+
+    if not cant_escape:
+        _mark_node_avoidable(conn, node_rc)
+        hist = [{"node": node_rc, "round": current_round, "outcome": "cleared - all cant-escape already avoidable"}]
+        memo[memo_key] = (True, hist)
+        return True, hist
+
+    # Parents of cant_escape, grouped by layer so each query uses literal
+    # layer parameters (index-friendly). Layers may differ because
+    # filter_avoidable_nodes can shift mid-traversal.
+    by_layer = {}
+    for rc, layer in cant_escape:
+        by_layer.setdefault(layer, []).append((rc, layer))
+
+    new_nodes = []
+    for layer, group in by_layer.items():
+        _create_temp_table_with_mod3(conn, "tmp_ce_layer", group)
+        new_nodes.extend(conn.execute("""
+            SELECT DISTINCT e.parent_reduced, e.parent_layer
+            FROM edges e
+            JOIN tmp_ce_layer t ON t.reduced_canonical = e.child_reduced
+                                AND t.layer = e.child_layer
+            WHERE e.child_layer = ?
+              AND e.parent_layer = ?
+        """, (layer, layer + 1)).fetchall())
+    new_nodes = list(set(new_nodes))
+
+    new_nodes = filter_new_target(new_nodes)
+    new_nodes = dedup_by_inevitable_mod3(new_nodes)
+
+    loop_set = {
+        (rc, layer) for rc, layer in new_nodes
+        if reduced_canonical_mod3(rc) == node_rc_mod3
+        or reduced_canonical_mod3(rc) == origin_rc_mod3
+    }
+    loop_nodes = sorted(loop_set)
+    new_nodes = [nl for nl in new_nodes if nl not in loop_set]
+
+    if not new_nodes and not loop_nodes:
+        _mark_node_avoidable(conn, node_rc)
+        hist = [{"node": node_rc, "round": current_round, "outcome": "cleared - new target empty after filtering"}]
+        memo[memo_key] = (True, hist)
+        return True, hist
+
+    new_nodes = sorted(new_nodes, key=lambda x: live_moves_fn(x[0]), reverse=True)
+
+    children = []
+    for child_rc, child_layer in loop_nodes:
+        children.append({
+            "child": child_rc,
+            "cleared": False,
+            "history": [{
+                "node": child_rc,
+                "round": current_round + 1,
+                "outcome": "loop - mod3 identical to origin",
+            }]
+        })
+
+    all_cleared = True
+    for child_rc, child_layer in new_nodes:
+        child_cleared, child_history = _propagate_node(
+            conn, child_rc, child_layer, origin_rc_mod3,
+            max_rounds, current_round + 1, live_moves_fn,
+            memo=memo, shift_cache=shift_cache
+        )
+        children.append({
+            "child": child_rc,
+            "cleared": child_cleared,
+            "history": child_history,
+        })
+        if not child_cleared:
+            all_cleared = False
+
+    if all_cleared:
+        _mark_node_avoidable(conn, node_rc)
+
+    outcome = "cleared" if all_cleared else "failed"
+    history = [{
+        "node": node_rc,
+        "round": current_round,
+        "new_nodes": [rc for rc, _ in (loop_nodes + new_nodes)],
+        "children": children,
+        "outcome": outcome,
+    }]
+
+    # Cache successes only — failures may become successes as avoidable_mod3 grows
+    if all_cleared:
+        memo[memo_key] = (True, history)
+
+    return all_cleared, history
+
+
+def _live_moves(rc: str) -> int:
+    """Sum of live gap moves (+m -> m, -i -> i-1), excluding inevitable counter."""
+    gaps_str = rc.split('|')[0]
+    if not gaps_str:
+        return 0
+    total = 0
+    for g in gaps_str.split(','):
+        orientation = 1 if g[0] == '+' else -1
+        size = int(g[1:])
+        total += size if orientation == 1 else size - 1
+    return total
+
+
+def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10,
+                   conn=None, memo=None, shift_cache=None):
     """
     Starting from a single (reduced_canonical, layer) node, recursively
     propagates each node's chain independently. Cleared only if all
     sub-chains are cleared.
+
+    conn:        optional existing connection. If provided, it is NOT closed here
+                 (caller owns it) — this lets resume_mark_avoidable reuse one
+                 connection and keep the page cache warm across nodes.
+    memo:        optional shared memo dict across calls.
+    shift_cache: optional shared shift-existence cache across calls.
     """
-    def live_moves(rc: str) -> int:
-        gaps_str = rc.split('|')[0]
-        if not gaps_str:
-            return 0
-        total = 0
-        for g in gaps_str.split(','):
-            orientation = 1 if g[0] == '+' else -1
-            size = int(g[1:])
-            total += size if orientation == 1 else size - 1
-        return total
-
-    db_path = os.path.join(os.getcwd(), f"reduced_gamestates_n{n}.db")
-    conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA cache_size = -4194304")  # 4 GB
-    conn.execute("PRAGMA temp_store = MEMORY")
-
-    try:
+    owns_conn = conn is None
+    if owns_conn:
+        db_path = os.path.join(os.getcwd(), f"reduced_gamestates_n{n}.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA cache_size = -4194304")  # 4 GB
+        conn.execute("PRAGMA temp_store = MEMORY")
         _ensure_tables(conn)
 
+    if memo is None:
+        memo = {}
+    if shift_cache is None:
+        shift_cache = {}
+
+    try:
         origin_rc_mod3 = reduced_canonical_mod3(start_rc)
 
         print(f"\n=== Analyzing {start_rc} at layer {start_layer} ===")
         proven_avoidable, history = _propagate_node(
             conn, start_rc, start_layer, origin_rc_mod3,
-            max_rounds, 1, live_moves
+            max_rounds, 1, _live_moves,
+            memo=memo, shift_cache=shift_cache
         )
 
         if proven_avoidable:
@@ -462,10 +591,8 @@ def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10
             safe_rc = start_rc.replace('|', '_').replace(',', '-').replace('+', 'p').replace(' ', '')
             subdir = os.path.join(os.getcwd(), f"avoidable_n{n}_layer{start_layer}")
             os.makedirs(subdir, exist_ok=True)
-            if proven_avoidable:
-                filename = f"avoidable_{safe_rc}_maxiter{max_rounds}.json"
-            else:
-                filename = f"failed_{safe_rc}_maxiter{max_rounds}.json"
+            prefix = "avoidable" if proven_avoidable else "failed"
+            filename = f"{prefix}_{safe_rc}_maxiter{max_rounds}.json"
             path = os.path.join(subdir, filename)
             with open(path, "w") as f:
                 json.dump({
@@ -482,83 +609,86 @@ def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10
         return proven_avoidable
 
     finally:
-        conn.close()
+        if owns_conn:
+            conn.close()
 
 
 def resume_mark_avoidable(n: int, k: int, max_rounds: int = 10):
+    """
+    Resumes avoidability analysis for all nodes at layer k with winner[0]=1,
+    skipping any already proven or already analyzed at this depth.
+
+    Uses a single connection and shared caches across all nodes so the page
+    cache stays warm and repeated subtrees are only computed once.
+    """
+    import time
+
     db_path = os.path.join(os.getcwd(), f"reduced_gamestates_n{n}.db")
     conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA cache_size = -4194304")  # 4 GB
+    conn.execute("PRAGMA temp_store = MEMORY")
 
     try:
-        try:
-            already_done = set(
-                r[0] for r in conn.execute(
-                    "SELECT reduced_canonical_mod3 FROM avoidable_mod3"
-                ).fetchall()
-            )
-            print(f"Found {len(already_done):,} already-proven avoidable mod3 forms in DB.")
-        except sqlite3.OperationalError:
-            already_done = set()
-            print("No avoidable_mod3 table found — starting fresh.")
+        _ensure_tables(conn)
 
-        # Also skip nodes already analyzed at this depth or deeper
-        try:
-            already_analyzed = set(
-                r[0] for r in conn.execute("""
-                    SELECT reduced_canonical FROM gamestates
-                    WHERE avoidable <= ?
-                """, (-max_rounds,)).fetchall()
-            )
-            print(f"Found {len(already_analyzed):,} nodes already analyzed at depth >= {max_rounds}.")
-        except sqlite3.OperationalError:
-            already_analyzed = set()
+        already_done = set(
+            r[0] for r in conn.execute(
+                "SELECT reduced_canonical_mod3 FROM avoidable_mod3"
+            ).fetchall()
+        )
+        print(f"Found {len(already_done):,} already-proven avoidable mod3 forms in DB.")
 
-    finally:
-        conn.close()
+        already_analyzed = set(
+            r[0] for r in conn.execute("""
+                SELECT reduced_canonical FROM gamestates
+                WHERE avoidable <= ?
+            """, (-max_rounds,)).fetchall()
+        )
+        print(f"Found {len(already_analyzed):,} nodes already analyzed at depth >= {max_rounds}.")
 
-    nodes = get_layer_nodes_by_moves(n, k)
-    print(f"Found {len(nodes):,} total nodes at layer {k} with winner[0]=1.")
+        rows = conn.execute("""
+            SELECT reduced_canonical FROM gamestates
+            WHERE layer = ?
+              AND winner IS NOT NULL
+              AND json_extract(winner, '$[0]') = 1
+        """, (k,)).fetchall()
+        nodes = sorted(
+            [(rc, k) for (rc,) in rows],
+            key=lambda x: _live_moves(x[0]), reverse=True
+        )
+        print(f"Found {len(nodes):,} total nodes at layer {k} with winner[0]=1.")
 
-    remaining = [
-        (rc, layer) for rc, layer in nodes
-        if reduced_canonical_mod3(rc) not in already_done
-        and rc not in already_analyzed
-    ]
-    print(f"Resuming from {len(remaining):,} remaining nodes.")
+        remaining = [
+            (rc, layer) for rc, layer in nodes
+            if reduced_canonical_mod3(rc) not in already_done
+            and rc not in already_analyzed
+        ]
+        print(f"Resuming from {len(remaining):,} remaining nodes.")
 
-    if not remaining:
-        print("All nodes already processed.")
-        return
+        if not remaining:
+            print("All nodes already processed.")
+            return
 
-    for i, (rc, layer) in enumerate(remaining):
-        print(f"\n{'='*60}")
-        print(f"Node {i+1}/{len(remaining)}: {rc} at layer {layer}")
-        print(f"{'='*60}")
-        mark_avoidable(n, rc, layer, max_rounds=max_rounds)
+        # Shared across all nodes in this run
+        memo = {}
+        shift_cache = {}
 
+        total_start = time.time()
+        for i, (rc, layer) in enumerate(remaining):
+            # Skip if a previous node's chain already proved this one avoidable
+            if reduced_canonical_mod3(rc) in already_done:
+                continue
+            node_start = time.time()
+            print(f"\n{'='*60}")
+            print(f"Node {i+1}/{len(remaining)}: {rc} at layer {layer}")
+            print(f"{'='*60}")
+            mark_avoidable(n, rc, layer, max_rounds=max_rounds,
+                           conn=conn, memo=memo, shift_cache=shift_cache)
+            already_done.add(reduced_canonical_mod3(rc))
+            print(f"  [node: {time.time()-node_start:.2f}s | "
+                  f"total: {time.time()-total_start:.2f}s | "
+                  f"memo: {len(memo):,} | shift_cache: {len(shift_cache):,}]")
 
-
-def clear_avoidable(n: int, max_layer: int = None):
-    """
-    Clears all avoidable labels from the gamestates table and empties
-    the avoidable_mod3 table. If max_layer is specified, only clears
-    nodes at layers <= max_layer.
-    """
-    db_path = os.path.join(os.getcwd(), f"reduced_gamestates_n{n}.db")
-    conn = sqlite3.connect(db_path)
-    try:
-        if max_layer is not None:
-            conn.execute("""
-                UPDATE gamestates SET avoidable = NULL
-                WHERE layer <= ? AND avoidable IS NOT NULL
-            """, (max_layer,))
-            print(f"Cleared avoidable labels for n={n}, layers 0-{max_layer}.")
-        else:
-            conn.execute("UPDATE gamestates SET avoidable = NULL")
-            print(f"Cleared all avoidable labels for n={n}.")
-
-        conn.execute("DELETE FROM avoidable_mod3")
-        conn.commit()
     finally:
         conn.close()
 
@@ -642,6 +772,23 @@ def get_longest_chains(n: int, layer: int, top_k: int = 20):
     return results
 
 
+
+# Compute layer vs gap+inevitable with extra +1 if odd # of negative gaps for each instance
+# These seem to be
+def compute_total(rc):
+    gaps_str, inev_str = rc.split('|')
+    inevitable = int(inev_str)
+    live_gap_total = 0
+    num_negs = 0
+    if gaps_str:
+        for g in gaps_str.split(','):
+            orientation = 1 if g[0] == '+' else -1
+            size = int(g[1:])
+            live_gap_total += size
+            if orientation == -1:
+                num_negs += 1
+    total = live_gap_total + inevitable + (1 if num_negs % 2 != 0 else 0)
+    return total, live_gap_total, inevitable, num_negs
 # The following checks which reduced canonicals differ in their parent sets across layers
 # It seems like it's only the ones where the reduced canonical does not "reduce" any move numbers
 def check_parents_layer_independent(n: int, check_layer: int, compare_layers: range = None, sample_size: int = 50, show: bool = False):
@@ -732,28 +879,14 @@ def check_parents_layer_independent(n: int, check_layer: int, compare_layers: ra
                 """, (rc, layer, turn)).fetchall()
                 parent_sets[(layer, turn)] = frozenset(r[0] for r in parents)
 
-            # Compute layer vs gap+inevitable with extra +1 if odd # of negative gaps for each instance
-            def compute_total(rc, layer):
-                gaps_str, inev_str = rc.split('|')
-                inevitable = int(inev_str)
-                live_gap_total = 0
-                num_negs = 0
-                if gaps_str:
-                    for g in gaps_str.split(','):
-                        orientation = 1 if g[0] == '+' else -1
-                        size = int(g[1:])
-                        live_gap_total += size
-                        if orientation == -1:
-                            num_negs += 1
-                total = live_gap_total + inevitable + (1 if num_negs % 2 != 0 else 0)
-                return total, live_gap_total, inevitable, num_negs
+
 
             # Check if any instance has total != layer
             layer_mismatches = []
             for (layer, turn), pset in sorted(parent_sets.items()):
                 if layer != check_layer:
                     continue
-                total, live_gap_total, inevitable, num_negs = compute_total(rc, layer)
+                total, live_gap_total, inevitable, num_negs = compute_total(rc)
                 if total != layer:
                     layer_mismatches.append((layer, turn, total, live_gap_total, inevitable))
 
@@ -800,3 +933,5 @@ def check_parents_layer_independent(n: int, check_layer: int, compare_layers: ra
 
     finally:
         conn.close()
+
+

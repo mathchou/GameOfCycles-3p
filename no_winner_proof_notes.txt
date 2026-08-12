@@ -117,9 +117,59 @@ Our proof will hinge on the fact that in general these infinite chains do not ar
 
 Strategy I:
 
+def filter_new_target(new_target: list) -> list:
+    """
+    From the new target set (list of (reduced_canonical, layer) tuples),
+    remove nodes where A and B can apply the 'keep moves 1 mod 3' strategy:
+      - has >= 2 positive gaps of size >= 3, AND
+      - total remaining moves is not 1 mod 3
+
+    Returns the filtered list (nodes that CANNOT be removed, i.e. still unavoidable).
+    """
+    filtered = []
+    removed = 0
+    for rc, layer in new_target:
+        if has_two_plus_gaps(rc) and total_moves_from_reduced(rc) % 3 != 1:
+            removed += 1
+        else:
+            filtered.append((rc, layer))
+    print(f"  Strategy filter: removed {removed:,}, kept {len(filtered):,}")
+    return filtered
 
 
 Now we begin to outline how we will recursively search the tree to determine if a node is avoidable.
 
 
+
+
+
+-----
+
+7-30-26
+
+We need to prove that ( |0) is avoidable at a layer that is 0,1,2 modulo 3.
+
+This will show that past some point (the biggest depth we needed to search past) whomever has the turn when we reach that point has no winning strategy.
+
+For example, since in layer 2, ( |0) is avoidable, this shows that Player 1 has no winning strategy at layers n \cong 2 modulo 3. It ALSO shows Player 2 has no winning strategy at layers n+1 \cong 2 modulo 3, and Player 3 has no winning strategy at layers n+2 \cong 2 modulo 3. (n+1 maybe needs to be n-1, same with n+2, need to think about how turns rotate).
+
+If we showed in layer 4, ( |0) is avoidable, then Player 1 has no winning strategy at layers n \cong 4 \cong 1 modulo 3, and so on for Player 2/3.
+
+Then finally if in layer 6, ( |0) is avoidable, then we've covered all congruences modulo 3 for all 3 players.
+
+
+
+Def: A *gap* is a tuple (n, +/-) where n is the length of the gap and +/- indicates the orientation of a gap. As shorthand we will simply write +n or -n
+
+Def: A *gamestate* is a list of gaps. A *canonical gamestate* is a ordered gamestate using a lexicographic ordering (descending in both indices).
+
+Def: A *reduced canonical gamestate* is a tuple (set of live-gaps, sum of moves left in inevitable-gaps) where a gap is considered inevitable if it is (<=2, +) or (<=4, -). The conversion between inevitable-gap length to moves left is given by (n,+) -> n, and (n,-) -> (n-1), since a -1 gap is unplayable, while a +1 gap is.
+
+Proposition: Any position in the Game of Cycles on an n-cycle with at least one move played can be represented by a reduced canonical gamestate.
+
+Proof: (Sketch) Since there is at least one move played, there will always be at least one gap. The order of the gaps doesn't matter so it can be arranged as a gamestate. Ever gamestate has a unique reduced canonical gamestate.
+
+-Give example of a few games being played through and their gamestates/reduced canonical as it progresses to the end. (Show how some gaps switch from live to inevitable as the game progresses.) Do a few examples to show different things.
+
+Note that all games end in the reduced canonical gamestate ( |0), i.e. no gaps and 0 inevitable moves to be played.
 
