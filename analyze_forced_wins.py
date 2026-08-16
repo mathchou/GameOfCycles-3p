@@ -151,15 +151,21 @@ def dedup_by_inevitable_mod3(new_target: list) -> list:
 # --------------------------------------
 # Backward Grandparent Analysis
 # --------------------------------------
-def _mark_node_avoidable(conn, rc: str):
-    """Mark a single reduced canonical as avoidable in DB and avoidable_mod3 table."""
+def _mark_node_avoidable(conn, rc: str, state: dict = None):
+    """
+    Mark a reduced canonical as avoidable in gamestates and avoidable_mod3.
+    Bumps state['generation'] only when a genuinely new mod3 form is inserted,
+    since that is the only event that can turn a cached failure into a success.
+    """
     conn.execute("""
         UPDATE gamestates SET avoidable = 1
         WHERE reduced_canonical = ? AND avoidable IS NULL
     """, (rc,))
-    conn.execute("""
+    cur = conn.execute("""
         INSERT OR IGNORE INTO avoidable_mod3 VALUES (?)
     """, (reduced_canonical_mod3(rc),))
+    if state is not None and cur.rowcount > 0:
+        state["generation"] += 1
 
 
 def get_layer_nodes_by_moves(n: int, layer: int) -> list:
@@ -375,44 +381,106 @@ def filter_avoidable_nodes(conn, target: list, k: int, shift_cache: dict = None)
     return can_escape, cant_escape, True
 
 
+def _memo_lookup(memo, key, remaining, state):
+    """
+    Return (hit, cleared, history). A miss returns (False, None, None).
+
+    Successes are stored with budget=None and generation=None: avoidability is
+    a property of the node and the tree, so once proven it holds regardless of
+    how many rounds remain or what has been proven since.
+
+    Failures mean "not proven within the budget available", so they are scoped
+    both ways:
+      budget     — a failure with budget B holds only for budgets <= B.
+      generation — a failure can become a success once new mod-3 forms are
+                   added to avoidable_mod3, so it is valid only while the
+                   generation counter is unchanged.
+
+    The exception is 'no grandparents exist in the DB', stored with both fields
+    None, since that depends only on DB contents and never changes in a run.
+    """
+    entry = memo.get(key)
+    if entry is None:
+        return False, None, None
+
+    if not entry["cleared"]:
+        if entry["budget"] is not None and remaining > entry["budget"]:
+            state["memo_stale_budget"] += 1
+            return False, None, None
+        if entry["generation"] is not None and entry["generation"] != state["generation"]:
+            state["memo_stale_gen"] += 1
+            return False, None, None
+
+    state["memo_hits"] += 1
+    return True, entry["cleared"], entry["history"]
+
+def _memo_store(memo, key, cleared, history, remaining, state,
+                budget_independent=False):
+    memo[key] = {
+        "cleared": cleared,
+        "history": history,
+        "generation": None if (cleared or budget_independent) else state["generation"],
+        "budget": None if (cleared or budget_independent) else remaining,
+    }
+
+
 def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
-                    current_round, live_moves_fn, memo=None, shift_cache=None):
+                    current_round, live_moves_fn, memo=None, shift_cache=None,
+                    state=None):
     """
     Recursively propagate a single node until it clears or max_rounds is reached.
 
-    memo: dict {(rc, layer): (cleared, history)} caching CLEARED results only.
-          Failures are not cached because avoidable_mod3 grows during the run,
-          so a node that failed early may succeed later.
-    shift_cache: dict {(rc, layer): shifted_layer} for the shift existence checks.
+    memo:  {(rc_mod3, layer): entry} — keyed on the mod-3 form because
+           dedup_by_inevitable_mod3 guarantees only one representative per
+           mod-3 class is ever propagated.
+    state: {'generation', 'memo_hits', 'memo_stale_gen', 'memo_stale_budget',
+            'comp_limit'} shared across the whole run.
     """
     if memo is None:
         memo = {}
     if shift_cache is None:
         shift_cache = {}
+    if state is None:
+        state = {"generation": 0, "memo_hits": 0, "memo_stale_gen": 0,
+                 "memo_stale_budget": 0, "comp_limit": 0}
 
     if current_round > max_rounds:
         return False, []
 
-    memo_key = (node_rc, node_layer)
-    if memo_key in memo:
-        cleared, cached_history = memo[memo_key]
-        print(f"  {'  ' * (current_round - 1)}[Round {current_round}] {node_rc} @ layer {node_layer} — cached (cleared)")
+    remaining = max_rounds - current_round
+    memo_key = (reduced_canonical_mod3(node_rc), node_layer)
+
+    hit, cleared, cached_history = _memo_lookup(memo, memo_key, remaining, state)
+    if hit:
+        tag = "cleared" if cleared else "failed"
+        print(f"  {'  ' * (current_round - 1)}[Round {current_round}] "
+              f"{node_rc} @ layer {node_layer} — cached ({tag})")
         return cleared, cached_history
 
     node_rc_mod3 = reduced_canonical_mod3(node_rc)
-    print(f"  {'  ' * (current_round - 1)}[Round {current_round}] Analyzing {node_rc} at layer {node_layer}")
+    print(f"  {'  ' * (current_round - 1)}[Round {current_round}] "
+          f"Analyzing {node_rc} at layer {node_layer}")
 
     can_escape, cant_escape, found_any = filter_avoidable_nodes(
         conn, [(node_rc, node_layer)], node_layer, shift_cache=shift_cache
     )
 
     if not found_any:
-        return False, [{"node": node_rc, "round": current_round, "outcome": "computational limit"}]
+        # No grandparents exist in the DB for this node. This depends only on
+        # the DB contents, so it can never change within a run — cache it
+        # permanently regardless of budget or generation.
+        state["comp_limit"] += 1
+        hist = [{"node": node_rc, "round": current_round,
+                 "outcome": "computational limit"}]
+        _memo_store(memo, memo_key, False, hist, remaining, state,
+                    budget_independent=True)
+        return False, hist
 
     if not cant_escape:
-        _mark_node_avoidable(conn, node_rc)
-        hist = [{"node": node_rc, "round": current_round, "outcome": "cleared - all grandparents escape"}]
-        memo[memo_key] = (True, hist)
+        _mark_node_avoidable(conn, node_rc, state)
+        hist = [{"node": node_rc, "round": current_round,
+                 "outcome": "cleared - all grandparents escape"}]
+        _memo_store(memo, memo_key, True, hist, remaining, state)
         return True, hist
 
     cant_escape = dedup_by_inevitable_mod3(cant_escape)
@@ -429,14 +497,15 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
     """).fetchall()
 
     if not cant_escape:
-        _mark_node_avoidable(conn, node_rc)
-        hist = [{"node": node_rc, "round": current_round, "outcome": "cleared - all cant-escape already avoidable"}]
-        memo[memo_key] = (True, hist)
+        _mark_node_avoidable(conn, node_rc, state)
+        hist = [{"node": node_rc, "round": current_round,
+                 "outcome": "cleared - all cant-escape already avoidable"}]
+        _memo_store(memo, memo_key, True, hist, remaining, state)
         return True, hist
 
-    # Parents of cant_escape, grouped by layer so each query uses literal
-    # layer parameters (index-friendly). Layers may differ because
-    # filter_avoidable_nodes can shift mid-traversal.
+    # Parents of cant_escape, grouped by layer so each query can use literal
+    # layer parameters. Layers may differ because filter_avoidable_nodes can
+    # shift mid-traversal.
     by_layer = {}
     for rc, layer in cant_escape:
         by_layer.setdefault(layer, []).append((rc, layer))
@@ -460,15 +529,16 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
     loop_set = {
         (rc, layer) for rc, layer in new_nodes
         if reduced_canonical_mod3(rc) == node_rc_mod3
-        or reduced_canonical_mod3(rc) == origin_rc_mod3
+           or reduced_canonical_mod3(rc) == origin_rc_mod3
     }
     loop_nodes = sorted(loop_set)
     new_nodes = [nl for nl in new_nodes if nl not in loop_set]
 
     if not new_nodes and not loop_nodes:
-        _mark_node_avoidable(conn, node_rc)
-        hist = [{"node": node_rc, "round": current_round, "outcome": "cleared - new target empty after filtering"}]
-        memo[memo_key] = (True, hist)
+        _mark_node_avoidable(conn, node_rc, state)
+        hist = [{"node": node_rc, "round": current_round,
+                 "outcome": "cleared - new target empty after filtering"}]
+        _memo_store(memo, memo_key, True, hist, remaining, state)
         return True, hist
 
     new_nodes = sorted(new_nodes, key=lambda x: live_moves_fn(x[0]), reverse=True)
@@ -490,7 +560,7 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
         child_cleared, child_history = _propagate_node(
             conn, child_rc, child_layer, origin_rc_mod3,
             max_rounds, current_round + 1, live_moves_fn,
-            memo=memo, shift_cache=shift_cache
+            memo=memo, shift_cache=shift_cache, state=state
         )
         children.append({
             "child": child_rc,
@@ -501,7 +571,7 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
             all_cleared = False
 
     if all_cleared:
-        _mark_node_avoidable(conn, node_rc)
+        _mark_node_avoidable(conn, node_rc, state)
 
     outcome = "cleared" if all_cleared else "failed"
     history = [{
@@ -512,10 +582,7 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
         "outcome": outcome,
     }]
 
-    # Cache successes only — failures may become successes as avoidable_mod3 grows
-    if all_cleared:
-        memo[memo_key] = (True, history)
-
+    _memo_store(memo, memo_key, all_cleared, history, remaining, state)
     return all_cleared, history
 
 
@@ -533,17 +600,12 @@ def _live_moves(rc: str) -> int:
 
 
 def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10,
-                   conn=None, memo=None, shift_cache=None):
+                   conn=None, memo=None, shift_cache=None, state=None):
     """
-    Starting from a single (reduced_canonical, layer) node, recursively
-    propagates each node's chain independently. Cleared only if all
-    sub-chains are cleared.
+    Analyze a single (reduced_canonical, layer) node.
 
-    conn:        optional existing connection. If provided, it is NOT closed here
-                 (caller owns it) — this lets resume_mark_avoidable reuse one
-                 connection and keep the page cache warm across nodes.
-    memo:        optional shared memo dict across calls.
-    shift_cache: optional shared shift-existence cache across calls.
+    conn/memo/shift_cache/state may be supplied by resume_mark_avoidable so a
+    whole layer shares one connection, one memo, and one generation counter.
     """
     owns_conn = conn is None
     if owns_conn:
@@ -557,6 +619,9 @@ def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10
         memo = {}
     if shift_cache is None:
         shift_cache = {}
+    if state is None:
+        state = {"generation": 0, "memo_hits": 0, "memo_stale_gen": 0,
+                 "memo_stale_budget": 0, "comp_limit": 0}
 
     try:
         origin_rc_mod3 = reduced_canonical_mod3(start_rc)
@@ -565,7 +630,7 @@ def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10
         proven_avoidable, history = _propagate_node(
             conn, start_rc, start_layer, origin_rc_mod3,
             max_rounds, 1, _live_moves,
-            memo=memo, shift_cache=shift_cache
+            memo=memo, shift_cache=shift_cache, state=state
         )
 
         if proven_avoidable:
@@ -615,11 +680,9 @@ def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10
 
 def resume_mark_avoidable(n: int, k: int, max_rounds: int = 10):
     """
-    Resumes avoidability analysis for all nodes at layer k with winner[0]=1,
-    skipping any already proven or already analyzed at this depth.
-
-    Uses a single connection and shared caches across all nodes so the page
-    cache stays warm and repeated subtrees are only computed once.
+    Resume avoidability analysis for all layer-k nodes with winner[0]=1,
+    sharing one connection, one memo, and one generation counter across
+    every node in the layer.
     """
     import time
 
@@ -658,40 +721,44 @@ def resume_mark_avoidable(n: int, k: int, max_rounds: int = 10):
         )
         print(f"Found {len(nodes):,} total nodes at layer {k} with winner[0]=1.")
 
-        remaining = [
+        remaining_nodes = [
             (rc, layer) for rc, layer in nodes
             if reduced_canonical_mod3(rc) not in already_done
-            and rc not in already_analyzed
+               and rc not in already_analyzed
         ]
-        print(f"Resuming from {len(remaining):,} remaining nodes.")
+        print(f"Resuming from {len(remaining_nodes):,} remaining nodes.")
 
-        if not remaining:
+        if not remaining_nodes:
             print("All nodes already processed.")
             return
 
-        # Shared across all nodes in this run
         memo = {}
         shift_cache = {}
+        state = {"generation": 0, "memo_hits": 0, "memo_stale_gen": 0,
+                 "memo_stale_budget": 0, "comp_limit": 0}
 
         total_start = time.time()
-        for i, (rc, layer) in enumerate(remaining):
-            # Skip if a previous node's chain already proved this one avoidable
+        for i, (rc, layer) in enumerate(remaining_nodes):
             if reduced_canonical_mod3(rc) in already_done:
                 continue
             node_start = time.time()
-            print(f"\n{'='*60}")
-            print(f"Node {i+1}/{len(remaining)}: {rc} at layer {layer}")
-            print(f"{'='*60}")
+            print(f"\n{'=' * 60}")
+            print(f"Node {i + 1}/{len(remaining_nodes)}: {rc} at layer {layer}")
+            print(f"{'=' * 60}")
             mark_avoidable(n, rc, layer, max_rounds=max_rounds,
-                           conn=conn, memo=memo, shift_cache=shift_cache)
+                           conn=conn, memo=memo, shift_cache=shift_cache,
+                           state=state)
             already_done.add(reduced_canonical_mod3(rc))
-            print(f"  [node: {time.time()-node_start:.2f}s | "
-                  f"total: {time.time()-total_start:.2f}s | "
-                  f"memo: {len(memo):,} | shift_cache: {len(shift_cache):,}]")
+            print(f"  [node {time.time() - node_start:.2f}s | "
+                  f"total {time.time() - total_start:.2f}s]")
+            print(f"  [memo {len(memo):,} entries, {state['memo_hits']:,} hits | "
+                  f"stale gen {state['memo_stale_gen']:,}, "
+                  f"budget {state['memo_stale_budget']:,} | "
+                  f"comp-limit {state['comp_limit']:,} | "
+                  f"gen {state['generation']:,}]")
 
     finally:
         conn.close()
-
 
 # ----------------------------------------------------------------------
 # Some analysis tools
@@ -789,6 +856,7 @@ def compute_total(rc):
                 num_negs += 1
     total = live_gap_total + inevitable + (1 if num_negs % 2 != 0 else 0)
     return total, live_gap_total, inevitable, num_negs
+
 # The following checks which reduced canonicals differ in their parent sets across layers
 # It seems like it's only the ones where the reduced canonical does not "reduce" any move numbers
 def check_parents_layer_independent(n: int, check_layer: int, compare_layers: range = None, sample_size: int = 50, show: bool = False):
