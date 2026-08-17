@@ -80,21 +80,30 @@ def _find_parents(conn, canonicals: list, tmp_name: str):
 # -------------------------------------------------------------------------------------------
 
 
+def _live_moves(rc: str) -> int:
+    """
+    Moves available from the live gaps only, excluding the inevitable counter.
+      +m gap -> m moves
+      -i gap -> i-1 moves
+    """
+    gaps_str = rc.split('|')[0]
+    if not gaps_str:
+        return 0
+    total = 0
+    for g in gaps_str.split(','):
+        orientation = 1 if g[0] == '+' else -1
+        size = int(g[1:])
+        total += size if orientation == 1 else size - 1
+    return total
+
+
 def total_moves_from_reduced(rc: str) -> int:
     """
-    Computes total remaining moves from a reduced canonical string.
-      +m gap  -> m moves
-      -i gap  -> i-1 moves
-      inevitable counter -> j moves
+    Total remaining moves: live gap moves plus the inevitable counter.
+    Distinct from compute_total, which counts -i as i and adds 1 for an odd
+    number of negative live gaps.
     """
-    gaps_str, inevitable_str = rc.split('|')
-    total = int(inevitable_str)
-    if gaps_str:
-        for g in gaps_str.split(','):
-            orientation = 1 if g[0] == '+' else -1
-            size = int(g[1:])
-            total += size if orientation == 1 else size - 1
-    return total
+    return _live_moves(rc) + int(rc.split('|')[1])
 
 
 def has_two_plus_gaps(rc: str) -> bool:
@@ -186,19 +195,8 @@ def get_layer_nodes_by_moves(n: int, layer: int) -> list:
     finally:
         conn.close()
 
-    def live_moves(rc: str) -> int:
-        gaps_str = rc.split('|')[0]
-        if not gaps_str:
-            return 0
-        total = 0
-        for g in gaps_str.split(','):
-            orientation = 1 if g[0] == '+' else -1
-            size = int(g[1:])
-            total += size if orientation == 1 else size - 1
-        return total
-
     nodes = [(rc, layer) for (rc,) in rows]
-    return sorted(nodes, key=lambda x: live_moves(x[0]), reverse=True)
+    return sorted(nodes, key=lambda x: _live_moves(x[0]), reverse=True)
 
 
 def get_layer_nodes_by_moves_include_all(n: int, layer: int) -> list:
@@ -251,7 +249,8 @@ def clear_avoidable(n: int):
 # --------------------------------------------------------------------------------------------
 
 
-def filter_avoidable_nodes(conn, target: list, k: int, shift_cache: dict = None):
+def filter_avoidable_nodes(conn, target: list, k: int, shift_cache: dict = None,
+                           max_layer: int = None):
     """
     Given a list of (reduced_canonical, layer) tuples, find all grandparents
     and classify them by winner[2].
@@ -259,32 +258,51 @@ def filter_avoidable_nodes(conn, target: list, k: int, shift_cache: dict = None)
     Applies the shift check at each hop: if compute_total(rc)[0] == layer for a
     node, shift it to (rc, layer+2) before looking up its parents.
 
-    shift_cache: optional dict for memoizing (rc, layer) -> shifted_layer lookups.
+    A shift that would land above max_layer means the tree simply does not
+    extend far enough to decide this node, so it is reported as the
+    computational limit rather than raised. A shift target that is missing
+    while BELOW the ceiling is still an error, since that indicates a genuine
+    gap in how the tree was built.
+
+    shift_cache: {(rc, layer): shifted_layer}, with None meaning "out of tree".
 
     Returns (can_escape, cant_escape, found_any) lists of (reduced_canonical, layer).
     found_any=False means no grandparents were found (computational limit reached).
     """
     if shift_cache is None:
         shift_cache = {}
+    if max_layer is None:
+        max_layer = conn.execute("SELECT MAX(layer) FROM gamestates").fetchone()[0]
 
     def apply_shift(nodes, label):
-        """Shift any node whose compute_total equals its layer. Cached."""
+        """
+        Shift any node whose compute_total equals its layer. Cached.
+        Returns None if any shift would run past the top of the tree.
+        """
         out = []
         for rc, layer in nodes:
             key = (rc, layer)
             if key in shift_cache:
-                out.append((rc, shift_cache[key]))
+                shifted = shift_cache[key]
+                if shifted is None:
+                    return None
+                out.append((rc, shifted))
                 continue
             if compute_total(rc)[0] == layer:
                 shifted_layer = layer + 2
+                if shifted_layer > max_layer:
+                    shift_cache[key] = None
+                    print(f"  → shift of {label} ({rc}, {layer}) needs layer "
+                          f"{shifted_layer} > max {max_layer} — out of tree")
+                    return None
                 exists = conn.execute("""
                     SELECT 1 FROM gamestates
                     WHERE reduced_canonical = ? AND layer = ? LIMIT 1
                 """, (rc, shifted_layer)).fetchone()
                 if not exists:
                     raise ValueError(
-                        f"Shifted {label} not found in DB: rc='{rc}' at layer {shifted_layer} "
-                        f"(original layer={layer}, compute_total={compute_total(rc)[0]})"
+                        f"Shifted {label} missing below the ceiling: rc='{rc}' at "
+                        f"layer {shifted_layer} (max {max_layer}) — real gap in the tree"
                     )
                 shift_cache[key] = shifted_layer
                 out.append((rc, shifted_layer))
@@ -319,6 +337,8 @@ def filter_avoidable_nodes(conn, target: list, k: int, shift_cache: dict = None)
 
     # Hop 0: shift the targets themselves
     shifted_target = apply_shift(target, "target")
+    if shifted_target is None:
+        return [], [], False
 
     # Hop 1: targets -> parents
     parents = parents_of(shifted_target, "tmp_target")
@@ -328,6 +348,8 @@ def filter_avoidable_nodes(conn, target: list, k: int, shift_cache: dict = None)
 
     # Hop 1.5: shift the parents before going up again
     shifted_parents = apply_shift(parents, "parent")
+    if shifted_parents is None:
+        return [], [], False
 
     # Hop 2: parents -> grandparents, reading winner[2] directly
     by_layer = {}
@@ -369,6 +391,42 @@ def filter_avoidable_nodes(conn, target: list, k: int, shift_cache: dict = None)
     print(f"  Cant escape (winner[2]=1): {len(cant_escape):,}")
 
     return can_escape, cant_escape, True
+
+
+def _new_state(conn=None, avoidable_set=None):
+    """
+    Build the shared run state.
+
+    avoidable_set: mod-3 forms already proven avoidable. Pass the caller's own
+                   set to share it by reference rather than copying, so nodes
+                   marked mid-recursion are visible to the caller too.
+                   If omitted and conn is given, it is loaded from the DB.
+    max_layer:     cached once so filter_avoidable_nodes need not re-query it.
+    """
+    if avoidable_set is None:
+        if conn is not None:
+            avoidable_set = set(
+                r[0] for r in conn.execute(
+                    "SELECT reduced_canonical_mod3 FROM avoidable_mod3"
+                ).fetchall()
+            )
+        else:
+            avoidable_set = set()
+
+    max_layer = None
+    if conn is not None:
+        max_layer = conn.execute("SELECT MAX(layer) FROM gamestates").fetchone()[0]
+
+    return {
+        "generation": 0,
+        "memo_hits": 0,
+        "memo_stale_gen": 0,
+        "memo_stale_budget": 0,
+        "comp_limit": 0,
+        "avoidable_hits": 0,
+        "avoidable_set": avoidable_set,
+        "max_layer": max_layer,
+    }
 
 
 def _memo_lookup(memo, key, remaining, state):
@@ -423,25 +481,26 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
     memo:  {(rc_mod3, layer): entry} — keyed on the mod-3 form because
            dedup_by_inevitable_mod3 guarantees only one representative per
            mod-3 class is ever propagated.
-    state: {'generation', 'memo_hits', 'memo_stale_gen', 'memo_stale_budget',
-            'comp_limit'} shared across the whole run.
+    state: shared across the whole run; see _new_state().
     """
     if memo is None:
         memo = {}
     if shift_cache is None:
         shift_cache = {}
     if state is None:
-        state = {"generation": 0, "memo_hits": 0, "memo_stale_gen": 0,
-                 "memo_stale_budget": 0, "comp_limit": 0}
+        state = _new_state()
 
     if current_round > max_rounds:
         return False, []
 
     remaining = max_rounds - current_round
-    memo_key = (reduced_canonical_mod3(node_rc), node_layer)
-
     node_rc_mod3 = reduced_canonical_mod3(node_rc)
+    memo_key = (node_rc_mod3, node_layer)
 
+    # Layer-independent: avoidability is a property of the position, so a
+    # mod-3 form proven anywhere is proven here. Checked before the memo
+    # because the memo is layer-keyed and would miss the same form at a
+    # different layer.
     if node_rc_mod3 in state["avoidable_set"]:
         state["avoidable_hits"] += 1
         print(f"  {'  ' * (current_round - 1)}[Round {current_round}] "
@@ -456,12 +515,12 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
               f"{node_rc} @ layer {node_layer} — cached ({tag})")
         return cleared, cached_history
 
-    node_rc_mod3 = reduced_canonical_mod3(node_rc)
     print(f"  {'  ' * (current_round - 1)}[Round {current_round}] "
           f"Analyzing {node_rc} at layer {node_layer}")
 
     can_escape, cant_escape, found_any = filter_avoidable_nodes(
-        conn, [(node_rc, node_layer)], node_layer, shift_cache=shift_cache
+        conn, [(node_rc, node_layer)], node_layer,
+        shift_cache=shift_cache, max_layer=state["max_layer"]
     )
 
     if not found_any:
@@ -585,19 +644,6 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
     return all_cleared, history
 
 
-def _live_moves(rc: str) -> int:
-    """Sum of live gap moves (+m -> m, -i -> i-1), excluding inevitable counter."""
-    gaps_str = rc.split('|')[0]
-    if not gaps_str:
-        return 0
-    total = 0
-    for g in gaps_str.split(','):
-        orientation = 1 if g[0] == '+' else -1
-        size = int(g[1:])
-        total += size if orientation == 1 else size - 1
-    return total
-
-
 def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10,
                    conn=None, memo=None, shift_cache=None, state=None):
     """
@@ -619,8 +665,8 @@ def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10
     if shift_cache is None:
         shift_cache = {}
     if state is None:
-        state = {"generation": 0, "memo_hits": 0, "memo_stale_gen": 0,
-                 "memo_stale_budget": 0, "comp_limit": 0}
+        # Standalone call: seed from the DB so prior runs still prune.
+        state = _new_state(conn)
 
     try:
         origin_rc_mod3 = reduced_canonical_mod3(start_rc)
@@ -633,13 +679,9 @@ def mark_avoidable(n: int, start_rc: str, start_layer: int, max_rounds: int = 10
         )
 
         if proven_avoidable:
-            conn.execute("""
-                UPDATE gamestates SET avoidable = 1
-                WHERE reduced_canonical = ? AND avoidable IS NULL
-            """, (start_rc,))
-            conn.execute("""
-                INSERT OR IGNORE INTO avoidable_mod3 VALUES (?)
-            """, (origin_rc_mod3,))
+            # _propagate_node already called _mark_node_avoidable on this node
+            # when it cleared, which wrote both tables and updated
+            # state['avoidable_set']. Only the commit is needed here.
             conn.commit()
             print(f"  Marked {start_rc} (mod3: {origin_rc_mod3}) as avoidable in DB.")
         else:
@@ -733,12 +775,9 @@ def resume_mark_avoidable(n: int, k: int, max_rounds: int = 10):
 
         memo = {}
         shift_cache = {}
-        state = {
-            "generation": 0,
-            "memo_hits": 0, "memo_stale_gen": 0, "memo_stale_budget": 0,
-            "comp_limit": 0, "avoidable_hits": 0,
-            "avoidable_set": set(already_done),
-        }
+        # Share already_done by reference, not a copy, so forms marked
+        # mid-recursion are visible to the top-level skip check below.
+        state = _new_state(conn, avoidable_set=already_done)
 
         total_start = time.time()
         for i, (rc, layer) in enumerate(remaining_nodes):
@@ -751,10 +790,11 @@ def resume_mark_avoidable(n: int, k: int, max_rounds: int = 10):
             mark_avoidable(n, rc, layer, max_rounds=max_rounds,
                            conn=conn, memo=memo, shift_cache=shift_cache,
                            state=state)
-            already_done.add(reduced_canonical_mod3(rc))
             print(f"  [node {time.time() - node_start:.2f}s | "
                   f"total {time.time() - total_start:.2f}s]")
             print(f"  [memo {len(memo):,} entries, {state['memo_hits']:,} hits | "
+                  f"avoidable-set {len(already_done):,} forms, "
+                  f"{state['avoidable_hits']:,} hits | "
                   f"stale gen {state['memo_stale_gen']:,}, "
                   f"budget {state['memo_stale_budget']:,} | "
                   f"comp-limit {state['comp_limit']:,} | "
@@ -1004,5 +1044,3 @@ def check_parents_layer_independent(n: int, check_layer: int, compare_layers: ra
 
     finally:
         conn.close()
-
-
