@@ -161,11 +161,11 @@ def _mark_node_avoidable(conn, rc: str, state: dict = None):
         UPDATE gamestates SET avoidable = 1
         WHERE reduced_canonical = ? AND avoidable IS NULL
     """, (rc,))
-    cur = conn.execute("""
-        INSERT OR IGNORE INTO avoidable_mod3 VALUES (?)
-    """, (reduced_canonical_mod3(rc),))
+    rc_mod3 = reduced_canonical_mod3(rc)
+    cur = conn.execute("INSERT OR IGNORE INTO avoidable_mod3 VALUES (?)", (rc_mod3,))
     if state is not None and cur.rowcount > 0:
         state["generation"] += 1
+        state["avoidable_set"].add(rc_mod3)
 
 
 def get_layer_nodes_by_moves(n: int, layer: int) -> list:
@@ -231,27 +231,17 @@ def _has_children(history: list) -> bool:
     return False
 
 
-def clear_avoidable(n: int, max_layer: int = None):
+def clear_avoidable(n: int):
     """
-    Clears all avoidable labels from the gamestates table and empties
-    the avoidable_mod3 table. If max_layer is specified, only clears
-    nodes at layers <= max_layer.
+    Clears all avoidability results for n. Nodes and edges are untouched.
     """
     db_path = os.path.join(os.getcwd(), f"reduced_gamestates_n{n}.db")
     conn = sqlite3.connect(db_path)
     try:
-        if max_layer is not None:
-            conn.execute("""
-                UPDATE gamestates SET avoidable = NULL
-                WHERE layer <= ? AND avoidable IS NOT NULL
-            """, (max_layer,))
-            print(f"Cleared avoidable labels for n={n}, layers 0-{max_layer}.")
-        else:
-            conn.execute("UPDATE gamestates SET avoidable = NULL")
-            print(f"Cleared all avoidable labels for n={n}.")
-
+        conn.execute("UPDATE gamestates SET avoidable = NULL WHERE avoidable IS NOT NULL")
         conn.execute("DELETE FROM avoidable_mod3")
         conn.commit()
+        print(f"Cleared all avoidable labels for n={n}.")
     finally:
         conn.close()
 
@@ -449,6 +439,15 @@ def _propagate_node(conn, node_rc, node_layer, origin_rc_mod3, max_rounds,
 
     remaining = max_rounds - current_round
     memo_key = (reduced_canonical_mod3(node_rc), node_layer)
+
+    node_rc_mod3 = reduced_canonical_mod3(node_rc)
+
+    if node_rc_mod3 in state["avoidable_set"]:
+        state["avoidable_hits"] += 1
+        print(f"  {'  ' * (current_round - 1)}[Round {current_round}] "
+              f"{node_rc} @ layer {node_layer} — already avoidable ({node_rc_mod3})")
+        return True, [{"node": node_rc, "round": current_round,
+                       "outcome": "already proven avoidable"}]
 
     hit, cleared, cached_history = _memo_lookup(memo, memo_key, remaining, state)
     if hit:
@@ -734,8 +733,12 @@ def resume_mark_avoidable(n: int, k: int, max_rounds: int = 10):
 
         memo = {}
         shift_cache = {}
-        state = {"generation": 0, "memo_hits": 0, "memo_stale_gen": 0,
-                 "memo_stale_budget": 0, "comp_limit": 0}
+        state = {
+            "generation": 0,
+            "memo_hits": 0, "memo_stale_gen": 0, "memo_stale_budget": 0,
+            "comp_limit": 0, "avoidable_hits": 0,
+            "avoidable_set": set(already_done),
+        }
 
         total_start = time.time()
         for i, (rc, layer) in enumerate(remaining_nodes):
